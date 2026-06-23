@@ -82,6 +82,8 @@ const TOOL_NETWORK_REQUESTS: &str = "agent_browser_network_requests";
 const TOOL_NETWORK_REQUEST: &str = "agent_browser_network_request";
 const TOOL_NETWORK_HAR_START: &str = "agent_browser_network_har_start";
 const TOOL_NETWORK_HAR_STOP: &str = "agent_browser_network_har_stop";
+const TOOL_NETWORK_SOCKETS: &str = "agent_browser_network_sockets";
+const TOOL_NETWORK_FRAMES: &str = "agent_browser_network_frames";
 const TOOL_STORAGE_GET: &str = "agent_browser_storage_get";
 const TOOL_STORAGE_SET: &str = "agent_browser_storage_set";
 const TOOL_STORAGE_CLEAR: &str = "agent_browser_storage_clear";
@@ -360,6 +362,8 @@ const NETWORK_PROFILE_TOOLS: &[&str] = &[
     TOOL_NETWORK_REQUEST,
     TOOL_NETWORK_HAR_START,
     TOOL_NETWORK_HAR_STOP,
+    TOOL_NETWORK_SOCKETS,
+    TOOL_NETWORK_FRAMES,
 ];
 
 const STATE_PROFILE_TOOLS: &[&str] = &[
@@ -1125,6 +1129,20 @@ fn parity_tools() -> Vec<Value> {
             "Show one request by id.",
             json!({ "requestId": { "type": "string" } }),
             &["requestId"],
+        ),
+        tool(
+            TOOL_NETWORK_SOCKETS,
+            "WebSocket connections",
+            "List captured WebSocket connections. Enables capture on first call; reconnect or act on the page to populate it.",
+            json!({ "clear": { "type": "boolean" }, "filter": { "type": "string", "description": "Only sockets whose URL contains this substring." }, "state": { "type": "string", "enum": ["open", "closed"] } }),
+            &[],
+        ),
+        tool(
+            TOOL_NETWORK_FRAMES,
+            "WebSocket frames",
+            "List captured frames for one WebSocket connection by socket id.",
+            json!({ "socketId": { "type": "string" }, "direction": { "type": "string", "enum": ["sent", "received"] }, "type": { "type": "string", "enum": ["text", "binary"] }, "filter": { "type": "string", "description": "Only frames whose payload contains this substring." } }),
+            &["socketId"],
         ),
         tool(
             TOOL_NETWORK_HAR_START,
@@ -2022,6 +2040,8 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_NETWORK_UNROUTE => call_optional_one(arguments, &["network", "unroute"], "url"),
         TOOL_NETWORK_REQUESTS => call_network_requests(arguments),
         TOOL_NETWORK_REQUEST => call_one_string(arguments, "network request", "requestId"),
+        TOOL_NETWORK_SOCKETS => call_network_sockets(arguments),
+        TOOL_NETWORK_FRAMES => call_network_frames(arguments),
         TOOL_NETWORK_HAR_START => call_literal(arguments, &["network", "har", "start"]),
         TOOL_NETWORK_HAR_STOP => call_optional_one(arguments, &["network", "har", "stop"], "path"),
         TOOL_STORAGE_GET => call_storage_get(arguments),
@@ -2615,6 +2635,36 @@ fn call_network_requests(arguments: &Value) -> Result<Value, ProtocolError> {
         ("type", "--type"),
         ("method", "--method"),
         ("status", "--status"),
+    ] {
+        if let Some(value) = optional_string(arguments, key)? {
+            args.push(flag.to_string());
+            args.push(value);
+        }
+    }
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_network_sockets(arguments: &Value) -> Result<Value, ProtocolError> {
+    let mut args = vec!["network".to_string(), "sockets".to_string()];
+    if optional_bool(arguments, "clear")?.unwrap_or(false) {
+        args.push("--clear".to_string());
+    }
+    for (key, flag) in [("filter", "--filter"), ("state", "--state")] {
+        if let Some(value) = optional_string(arguments, key)? {
+            args.push(flag.to_string());
+            args.push(value);
+        }
+    }
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_network_frames(arguments: &Value) -> Result<Value, ProtocolError> {
+    let socket_id = required_string(arguments, "socketId")?;
+    let mut args = vec!["network".to_string(), "frames".to_string(), socket_id];
+    for (key, flag) in [
+        ("direction", "--direction"),
+        ("type", "--type"),
+        ("filter", "--filter"),
     ] {
         if let Some(value) = optional_string(arguments, key)? {
             args.push(flag.to_string());
@@ -3530,6 +3580,16 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), tools.len());
+    }
+
+    #[test]
+    fn websocket_tools_registered_in_network_profile() {
+        assert!(NETWORK_PROFILE_TOOLS.contains(&TOOL_NETWORK_SOCKETS));
+        assert!(NETWORK_PROFILE_TOOLS.contains(&TOOL_NETWORK_FRAMES));
+        let tools = tools();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&TOOL_NETWORK_SOCKETS));
+        assert!(names.contains(&TOOL_NETWORK_FRAMES));
     }
 
     #[test]
