@@ -8008,6 +8008,40 @@ fn record_socket_frame(sockets: &mut [TrackedSocket], params: &Value, direction:
     }
 }
 
+/// One parsed term of a `--filter` value: a compiled regex, or a literal
+/// substring used when the term is not valid regex.
+enum FilterTerm {
+    Regex(regex::Regex),
+    Literal(String),
+}
+
+/// Parse a `--filter` value into terms. The value is a comma-separated list;
+/// each term is compiled as a regex, falling back to a literal substring when
+/// it is not valid regex (so a stray `(` still matches as plain text). Empty
+/// terms are dropped, so an empty filter parses to no terms and matches all.
+fn parse_filter_terms(filter: &str) -> Vec<FilterTerm> {
+    filter
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| match regex::Regex::new(t) {
+            Ok(re) => FilterTerm::Regex(re),
+            Err(_) => FilterTerm::Literal(t.to_string()),
+        })
+        .collect()
+}
+
+/// True when `haystack` matches any term (OR), or when there are no terms.
+fn terms_match(terms: &[FilterTerm], haystack: &str) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    terms.iter().any(|term| match term {
+        FilterTerm::Regex(re) => re.is_match(haystack),
+        FilterTerm::Literal(s) => haystack.contains(s),
+    })
+}
+
 /// True when a frame's opcode matches a `text`/`binary` filter; any other
 /// filter value matches every frame.
 fn opcode_matches_type(opcode: i64, type_filter: &str) -> bool {
@@ -8062,15 +8096,18 @@ async fn handle_sockets(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
 
     ensure_socket_tracking(state).await;
 
-    let filter = cmd.get("filter").and_then(|v| v.as_str());
+    let filter_terms = cmd
+        .get("filter")
+        .and_then(|v| v.as_str())
+        .map(parse_filter_terms);
     let state_filter = cmd.get("state").and_then(|v| v.as_str());
 
     let sockets: Vec<Value> = state
         .tracked_sockets
         .iter()
         .filter(|s| {
-            if let Some(f) = filter {
-                if !s.url.contains(f) {
+            if let Some(ref terms) = filter_terms {
+                if !terms_match(terms, &s.url) {
                     return false;
                 }
             }
@@ -8100,9 +8137,12 @@ async fn handle_frames(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 
     let direction = cmd.get("direction").and_then(|v| v.as_str());
     let type_filter = cmd.get("type").and_then(|v| v.as_str());
-    let filter = cmd.get("filter").and_then(|v| v.as_str());
+    let filter_terms = cmd
+        .get("filter")
+        .and_then(|v| v.as_str())
+        .map(parse_filter_terms);
 
-    let frames: Vec<&SocketFrame> = sock
+    let matched: Vec<&SocketFrame> = sock
         .frames
         .iter()
         .filter(|f| {
@@ -8116,8 +8156,8 @@ async fn handle_frames(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                     return false;
                 }
             }
-            if let Some(needle) = filter {
-                if !f.payload_data.contains(needle) {
+            if let Some(ref terms) = filter_terms {
+                if !terms_match(terms, &f.payload_data) {
                     return false;
                 }
             }
@@ -8125,10 +8165,31 @@ async fn handle_frames(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         })
         .collect();
 
+    // `total` is the count after content filters but before the range window,
+    // so a caller paging with --limit/--offset knows how much is left.
+    let total = matched.len();
+    let tail = cmd.get("tail").and_then(|v| v.as_u64()).map(|n| n as usize);
+    let frames: Vec<&SocketFrame> = if let Some(tail) = tail {
+        matched[total.saturating_sub(tail)..].to_vec()
+    } else {
+        let offset = cmd
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(0)
+            .min(total);
+        let mut windowed: Vec<&SocketFrame> = matched[offset..].to_vec();
+        if let Some(limit) = cmd.get("limit").and_then(|v| v.as_u64()) {
+            windowed.truncate(limit as usize);
+        }
+        windowed
+    };
+
     Ok(json!({
         "socketId": sock.socket_id,
         "url": sock.url,
         "state": if sock.closed { "closed" } else { "open" },
+        "total": total,
         "frames": frames,
     }))
 }
@@ -9091,6 +9152,92 @@ mod tests {
         assert_eq!(summary["frames"]["sent"], 1);
         assert_eq!(summary["frames"]["received"], 1);
         assert_eq!(summary["frames"]["total"], 2);
+    }
+
+    #[test]
+    fn terms_match_supports_regex_multiterm_and_literal_fallback() {
+        // Single regex term.
+        let terms = parse_filter_terms(r#""m":"qsd""#);
+        assert!(terms_match(&terms, r#"{"m":"qsd","p":[]}"#));
+        assert!(!terms_match(&terms, r#"{"m":"timescale_update"}"#));
+
+        // Comma-separated terms match if any one matches (OR).
+        let terms = parse_filter_terms("auth,quote");
+        assert!(terms_match(&terms, "set_auth_token"));
+        assert!(terms_match(&terms, "quote_create_session"));
+        assert!(!terms_match(&terms, "set_locale"));
+
+        // A real regex term.
+        let terms = parse_filter_terms(r"qs_\w+");
+        assert!(terms_match(&terms, "qs_multiplexer_simple"));
+        assert!(!terms_match(&terms, "session_id"));
+
+        // An invalid regex falls back to literal substring matching.
+        let terms = parse_filter_terms("price(");
+        assert!(terms_match(&terms, "last price(usd)"));
+        assert!(!terms_match(&terms, "volume"));
+
+        // An empty filter parses to no terms and matches everything.
+        assert!(terms_match(&parse_filter_terms(""), "anything"));
+    }
+
+    fn socket_with_n_frames(n: usize) -> TrackedSocket {
+        let mut sock = sample_socket();
+        for i in 0..n {
+            sock.frames.push(SocketFrame {
+                direction: if i % 2 == 0 { "sent" } else { "received" },
+                opcode: 1,
+                payload_data: i.to_string(),
+                timestamp: 0,
+            });
+        }
+        sock
+    }
+
+    #[tokio::test]
+    async fn handle_frames_tail_returns_most_recent() {
+        let mut state = DaemonState::new();
+        state.tracked_sockets.push(socket_with_n_frames(10));
+        let result = handle_frames(&json!({ "socketId": "s1", "tail": 3 }), &mut state)
+            .await
+            .unwrap();
+        assert_eq!(result["total"], 10);
+        let frames = result["frames"].as_array().unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0]["payloadData"], "7");
+        assert_eq!(frames[2]["payloadData"], "9");
+    }
+
+    #[tokio::test]
+    async fn handle_frames_limit_offset_pages() {
+        let mut state = DaemonState::new();
+        state.tracked_sockets.push(socket_with_n_frames(10));
+        let result = handle_frames(
+            &json!({ "socketId": "s1", "limit": 2, "offset": 4 }),
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["total"], 10);
+        let frames = result["frames"].as_array().unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0]["payloadData"], "4");
+        assert_eq!(frames[1]["payloadData"], "5");
+    }
+
+    #[tokio::test]
+    async fn handle_frames_total_counts_after_filter() {
+        let mut state = DaemonState::new();
+        state.tracked_sockets.push(socket_with_n_frames(10));
+        // Only the five "received" frames (odd indices) survive the filter.
+        let result = handle_frames(
+            &json!({ "socketId": "s1", "direction": "received" }),
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["total"], 5);
+        assert_eq!(result["frames"].as_array().unwrap().len(), 5);
     }
 
     #[test]

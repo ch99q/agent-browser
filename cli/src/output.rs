@@ -2060,12 +2060,15 @@ Subcommands:
   request <requestId>        View full request/response detail (including body)
   sockets [options]          List captured WebSocket connections
     --clear                  Clear the captured socket log
-    --filter <pattern>       Filter by URL substring
+    --filter <terms>         Filter by URL (comma-separated regex/substring terms, OR)
     --state <open|closed>    Filter by connection state
   frames <socketId> [opts]   List captured frames for one WebSocket
     --direction <dir>        Filter by direction (sent, received)
     --type <kind>            Filter by frame kind (text, binary)
-    --filter <substring>     Filter by payload substring
+    --filter <terms>         Filter by payload (comma-separated regex/substring terms, OR)
+    --tail <n>               Return only the most recent n frames
+    --limit <n>              Return at most n frames (from --offset)
+    --offset <n>             Skip the first n frames
   har <start|stop> [path]    Record and export a HAR file
 
 Global Options:
@@ -2086,6 +2089,9 @@ Examples:
   agent-browser network sockets --filter wss://data --state open
   agent-browser network frames 62270.358
   agent-browser network frames 62270.358 --direction received --type text
+  agent-browser network frames 62270.358 --tail 20
+  agent-browser network frames 62270.358 --limit 50 --offset 100
+  agent-browser network frames 62270.358 --filter "quote_create,set_auth"
   agent-browser network har start
   agent-browser network har stop ./capture.har
 "##

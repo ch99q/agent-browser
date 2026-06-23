@@ -2772,7 +2772,7 @@ fn parse_network(rest: &[&str], id: &str) -> Result<Value, ParseError> {
         Some("frames") => {
             let socket_id = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                 context: "network frames".to_string(),
-                usage: "network frames <socketId> [--direction <sent|received>] [--type <text|binary>] [--filter <substring>]",
+                usage: "network frames <socketId> [--direction <sent|received>] [--type <text|binary>] [--filter <terms>] [--tail <n>] [--limit <n>] [--offset <n>]",
             })?;
             let direction_idx = rest.iter().position(|&s| s == "--direction");
             let direction = direction_idx.and_then(|i| rest.get(i + 1).copied());
@@ -2789,6 +2789,20 @@ fn parse_network(rest: &[&str], id: &str) -> Result<Value, ParseError> {
             }
             if let Some(f) = filter {
                 cmd["filter"] = json!(f);
+            }
+            for (flag, key) in [
+                ("--tail", "tail"),
+                ("--limit", "limit"),
+                ("--offset", "offset"),
+            ] {
+                if let Some(n) = rest
+                    .iter()
+                    .position(|&s| s == flag)
+                    .and_then(|i| rest.get(i + 1))
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    cmd[key] = json!(n);
+                }
             }
             Ok(cmd)
         }
@@ -3862,6 +3876,31 @@ mod tests {
     fn test_network_frames_requires_id() {
         let result = parse_command(&args("network frames"), &default_flags());
         assert!(matches!(result, Err(ParseError::MissingArguments { .. })));
+    }
+
+    #[test]
+    fn test_network_frames_tail() {
+        let cmd = parse_command(&args("network frames 12.3 --tail 20"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "frames");
+        assert_eq!(cmd["tail"], 20);
+    }
+
+    #[test]
+    fn test_network_frames_limit_offset() {
+        let cmd = parse_command(
+            &args("network frames 12.3 --limit 50 --offset 100"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["limit"], 50);
+        assert_eq!(cmd["offset"], 100);
+    }
+
+    #[test]
+    fn test_network_frames_ignores_non_numeric_range() {
+        let cmd = parse_command(&args("network frames 12.3 --tail abc"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "frames");
+        assert!(cmd.get("tail").is_none());
     }
 
     // === Screenshot ===

@@ -1134,14 +1134,14 @@ fn parity_tools() -> Vec<Value> {
             TOOL_NETWORK_SOCKETS,
             "WebSocket connections",
             "List captured WebSocket connections. Enables capture on first call; reconnect or act on the page to populate it.",
-            json!({ "clear": { "type": "boolean" }, "filter": { "type": "string", "description": "Only sockets whose URL contains this substring." }, "state": { "type": "string", "enum": ["open", "closed"] } }),
+            json!({ "clear": { "type": "boolean" }, "filter": { "type": "string", "description": "Match the socket URL. Comma-separated terms (OR); each term is a regex, falling back to a substring when not valid regex." }, "state": { "type": "string", "enum": ["open", "closed"] } }),
             &[],
         ),
         tool(
             TOOL_NETWORK_FRAMES,
             "WebSocket frames",
-            "List captured frames for one WebSocket connection by socket id.",
-            json!({ "socketId": { "type": "string" }, "direction": { "type": "string", "enum": ["sent", "received"] }, "type": { "type": "string", "enum": ["text", "binary"] }, "filter": { "type": "string", "description": "Only frames whose payload contains this substring." } }),
+            "List captured frames for one WebSocket connection by socket id. Returns a `total` count (after filters) so you can page with limit/offset.",
+            json!({ "socketId": { "type": "string" }, "direction": { "type": "string", "enum": ["sent", "received"] }, "type": { "type": "string", "enum": ["text", "binary"] }, "filter": { "type": "string", "description": "Match the frame payload. Comma-separated terms (OR); each term is a regex, falling back to a substring when not valid regex." }, "tail": { "type": "integer", "minimum": 0, "description": "Return only the most recent N frames." }, "limit": { "type": "integer", "minimum": 0, "description": "Return at most N frames, from `offset`." }, "offset": { "type": "integer", "minimum": 0, "description": "Skip the first N frames." } }),
             &["socketId"],
         ),
         tool(
@@ -2669,6 +2669,16 @@ fn call_network_frames(arguments: &Value) -> Result<Value, ProtocolError> {
         if let Some(value) = optional_string(arguments, key)? {
             args.push(flag.to_string());
             args.push(value);
+        }
+    }
+    for (key, flag) in [
+        ("tail", "--tail"),
+        ("limit", "--limit"),
+        ("offset", "--offset"),
+    ] {
+        if let Some(value) = optional_u64(arguments, key)? {
+            args.push(flag.to_string());
+            args.push(value.to_string());
         }
     }
     call_cli_tool(arguments, args, None)
