@@ -1,6 +1,6 @@
 # Network
 
-Use network commands to intercept requests, mock responses, inspect traffic, and export HAR files during browser automation.
+Use network commands to intercept requests, mock responses, inspect traffic, monitor WebSocket channels, and export HAR files during browser automation.
 
 ## Request routing
 
@@ -54,6 +54,38 @@ agent-browser network requests --clear
 </table>
 
 Use `network request <requestId>` to inspect one request and response in detail after finding its ID in `network requests`.
+
+## WebSocket monitoring
+
+`network sockets` lists the WebSocket connections a page has opened, and `network frames` reads the frames captured for one connection. Capture starts the first time you run `network sockets`, so run it before the socket opens, then act on the page (or reconnect) so frames stream in.
+
+```bash
+agent-browser open https://app.example.com
+agent-browser network sockets
+agent-browser click @e4
+agent-browser network sockets --state open
+agent-browser network frames <socketId> --direction received --type text
+```
+
+Each connection has a `socketId` that ties its frames together. `network sockets` returns one summary row per connection with its URL, state, and per-direction frame counts. Pass a `socketId` to `network frames` to read the payloads.
+
+<table>
+  <thead>
+    <tr><th>Command</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>network sockets</code></td><td>List captured WebSocket connections</td></tr>
+    <tr><td><code>network sockets --filter &lt;substring&gt;</code></td><td>Filter sockets by URL substring</td></tr>
+    <tr><td><code>network sockets --state &lt;open|closed&gt;</code></td><td>Filter sockets by connection state</td></tr>
+    <tr><td><code>network sockets --clear</code></td><td>Clear the captured socket log</td></tr>
+    <tr><td><code>network frames &lt;socketId&gt;</code></td><td>List frames for one connection</td></tr>
+    <tr><td><code>network frames &lt;socketId&gt; --direction &lt;sent|received&gt;</code></td><td>Filter frames by direction</td></tr>
+    <tr><td><code>network frames &lt;socketId&gt; --type &lt;text|binary&gt;</code></td><td>Filter frames by kind</td></tr>
+    <tr><td><code>network frames &lt;socketId&gt; --filter &lt;substring&gt;</code></td><td>Filter frames by payload substring</td></tr>
+  </tbody>
+</table>
+
+Binary frames are reported as base64 in the `payloadData` field, exactly as Chrome delivers them. A busy socket is capped at the most recent frames per connection, so older frames roll off during a long session.
 
 ## HAR export
 

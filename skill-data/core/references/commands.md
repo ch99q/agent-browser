@@ -184,6 +184,10 @@ agent-browser network route <url> --body '{}'  # Mock response
 agent-browser network unroute [url]            # Remove routes
 agent-browser network requests                 # View tracked requests
 agent-browser network requests --filter api    # Filter requests
+agent-browser network sockets                  # List captured WebSocket connections
+agent-browser network sockets --state open     # Filter sockets by state
+agent-browser network frames <socketId>        # List frames for one WebSocket
+agent-browser network frames <socketId> --direction received --type text
 ```
 
 ## Tabs and Windows
@@ -328,7 +332,7 @@ The default tools profile is `core`, which keeps MCP context small for everyday 
 Profiles:
 
 - `core` - Default. Navigation, snapshots, interaction, waits, reads, screenshots, JavaScript eval, close, tab basics, and profile discovery
-- `network` - Network routes, request inspection, HAR, headers, credentials, offline
+- `network` - Network routes, request inspection, WebSocket monitoring, HAR, headers, credentials, offline
 - `state` - Cookies, storage, auth, saved state, sessions, profiles, skills
 - `debug` - Console/errors, tracing, profiling, recording, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
 - `tabs` - Back/forward/reload, tabs, windows, frames, dialogs

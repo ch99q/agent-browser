@@ -299,6 +299,18 @@ agent-browser network har start                                    # record all 
 agent-browser network har stop /tmp/trace.har
 ```
 
+### Watch WebSocket channels
+
+```bash
+agent-browser network sockets                  # enable capture, list connections
+# ... act on the page so sockets open and stream ...
+agent-browser network sockets --state open     # only live connections
+agent-browser network frames <socketId>        # read frames for one connection
+agent-browser network frames <socketId> --direction received --type text
+```
+
+Capture starts on the first `network sockets` call, so run it before the socket opens (or reconnect afterward). Each connection has a `socketId`; pass it to `network frames` to read the payloads.
+
 ### Record a video of the workflow
 
 ```bash

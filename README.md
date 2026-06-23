@@ -296,9 +296,17 @@ agent-browser network requests --type xhr,fetch  # Filter by resource type
 agent-browser network requests --method POST   # Filter by HTTP method
 agent-browser network requests --status 2xx    # Filter by status (200, 2xx, 400-499)
 agent-browser network request <requestId>      # View full request/response detail
+agent-browser network sockets                  # List captured WebSocket connections
+agent-browser network sockets --filter wss://data --state open  # Filter sockets
+agent-browser network frames <socketId>        # List frames for one WebSocket
+agent-browser network frames <socketId> --direction received --type text  # Filter frames
 agent-browser network har start                # Start HAR recording
 agent-browser network har stop [output.har]    # Stop and save HAR (temp path if omitted)
 ```
+
+Socket capture starts the first time you run `network sockets`, so connections that
+were already open before that call are not captured. Run it once, then act on the page
+(or reconnect) to populate the log, the same way request tracking works.
 
 ### Tabs & Windows
 
