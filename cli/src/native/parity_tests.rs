@@ -173,6 +173,8 @@ const DOCUMENTED_ACTIONS: &[&str] = &[
     "unroute",
     "requests",
     "request_detail",
+    "sockets",
+    "frames",
     "credentials",
     "auth_save",
     "auth_login",

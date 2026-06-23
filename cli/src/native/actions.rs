@@ -136,6 +136,47 @@ pub struct TrackedRequest {
     pub mime_type: Option<String>,
 }
 
+/// Per-socket frame cap. A WebSocket carrying a live feed or busy chat can emit
+/// thousands of frames a second, so an uncapped buffer would grow without bound
+/// over a long session. Oldest frames are dropped first; raise this for deeper
+/// history at the cost of memory.
+const MAX_SOCKET_FRAMES: usize = 1000;
+
+/// One WebSocket frame, captured from CDP `Network.webSocketFrameSent` and
+/// `Network.webSocketFrameReceived`.
+#[derive(Clone, serde::Serialize)]
+pub struct SocketFrame {
+    /// "sent" for client to server, "received" for server to client.
+    pub direction: &'static str,
+    /// CDP opcode: 1 text, 2 binary, 8 close, 9 ping, 10 pong.
+    pub opcode: i64,
+    /// Payload exactly as CDP delivers it: UTF-8 text for opcode 1, base64 for
+    /// binary opcode 2.
+    #[serde(rename = "payloadData")]
+    pub payload_data: String,
+    /// Milliseconds since the Unix epoch when the frame was captured.
+    pub timestamp: u64,
+}
+
+/// A WebSocket connection observed on the page, with its captured frames.
+/// Populated from CDP `Network.webSocket*` events while socket tracking is on.
+#[derive(Clone, serde::Serialize)]
+pub struct TrackedSocket {
+    /// CDP request id that ties every event of this socket together.
+    #[serde(rename = "socketId")]
+    pub socket_id: String,
+    pub url: String,
+    /// Milliseconds since the Unix epoch when the socket opened.
+    #[serde(rename = "createdAt")]
+    pub created_at: u64,
+    /// True once CDP reports `Network.webSocketClosed`.
+    pub closed: bool,
+    /// Last error from `Network.webSocketFrameError`, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub frames: Vec<SocketFrame>,
+}
+
 pub struct FetchPausedRequest {
     pub request_id: String,
     pub url: String,
@@ -235,6 +276,8 @@ pub struct DaemonState {
     pub routes: Arc<RwLock<Vec<RouteEntry>>>,
     pub tracked_requests: Vec<TrackedRequest>,
     pub request_tracking: bool,
+    pub tracked_sockets: Vec<TrackedSocket>,
+    pub socket_tracking: bool,
     pub active_frame_id: Option<String>,
     /// Cross-origin iframe frame_id → dedicated CDP session_id.
     /// Populated by Target.attachedToTarget events from Target.setAutoAttach.
@@ -314,6 +357,8 @@ impl DaemonState {
             routes: Arc::new(RwLock::new(Vec::new())),
             tracked_requests: Vec::new(),
             request_tracking: false,
+            tracked_sockets: Vec::new(),
+            socket_tracking: false,
             active_frame_id: None,
             iframe_sessions: HashMap::new(),
             origin_headers: Arc::new(RwLock::new(HashMap::new())),
@@ -1100,6 +1145,74 @@ impl DaemonState {
                                 }
                             }
                         }
+                        "Network.webSocketCreated" if self.socket_tracking => {
+                            let socket_id = event
+                                .params
+                                .get("requestId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let url = event
+                                .params
+                                .get("url")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            self.tracked_sockets.push(TrackedSocket {
+                                socket_id,
+                                url,
+                                created_at: unix_timestamp_millis() as u64,
+                                closed: false,
+                                error: None,
+                                frames: Vec::new(),
+                            });
+                        }
+                        "Network.webSocketFrameSent" if self.socket_tracking => {
+                            record_socket_frame(&mut self.tracked_sockets, &event.params, "sent");
+                        }
+                        "Network.webSocketFrameReceived" if self.socket_tracking => {
+                            record_socket_frame(
+                                &mut self.tracked_sockets,
+                                &event.params,
+                                "received",
+                            );
+                        }
+                        "Network.webSocketFrameError" if self.socket_tracking => {
+                            let socket_id = event
+                                .params
+                                .get("requestId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let message = event
+                                .params
+                                .get("errorMessage")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if let Some(sock) = self
+                                .tracked_sockets
+                                .iter_mut()
+                                .rev()
+                                .find(|s| s.socket_id == socket_id)
+                            {
+                                sock.error = Some(message);
+                            }
+                        }
+                        "Network.webSocketClosed" if self.socket_tracking => {
+                            let socket_id = event
+                                .params
+                                .get("requestId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if let Some(sock) = self
+                                .tracked_sockets
+                                .iter_mut()
+                                .rev()
+                                .find(|s| s.socket_id == socket_id)
+                            {
+                                sock.closed = true;
+                            }
+                        }
                         // Frame broadcasting and acks are handled in real-time by the
                         // stream server's background CDP event loop. Here we just
                         // collect acks as a fallback for non-streaming mode.
@@ -1677,6 +1790,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "unroute" => handle_unroute(cmd, state).await,
         "requests" => handle_requests(cmd, state).await,
         "request_detail" => handle_request_detail(cmd, state).await,
+        "sockets" => handle_sockets(cmd, state).await,
+        "frames" => handle_frames(cmd, state).await,
         "credentials" => handle_http_credentials(cmd, state).await,
         "emulatemedia" => handle_set_media(cmd, state).await,
         "auth_save" => handle_auth_save(cmd).await,
@@ -7862,6 +7977,162 @@ async fn handle_request_detail(cmd: &Value, state: &mut DaemonState) -> Result<V
     Ok(result)
 }
 
+/// Append a captured frame to its socket, dropping the oldest frame once the
+/// per-socket cap is reached. Silently ignores frames for an unknown socket id,
+/// which happens when capture started after the socket was already open.
+fn record_socket_frame(sockets: &mut [TrackedSocket], params: &Value, direction: &'static str) {
+    let socket_id = params
+        .get("requestId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let response = match params.get("response") {
+        Some(r) => r,
+        None => return,
+    };
+    let opcode = response.get("opcode").and_then(|v| v.as_i64()).unwrap_or(0);
+    let payload_data = response
+        .get("payloadData")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if let Some(sock) = sockets.iter_mut().rev().find(|s| s.socket_id == socket_id) {
+        if sock.frames.len() >= MAX_SOCKET_FRAMES {
+            sock.frames.remove(0);
+        }
+        sock.frames.push(SocketFrame {
+            direction,
+            opcode,
+            payload_data,
+            timestamp: unix_timestamp_millis() as u64,
+        });
+    }
+}
+
+/// True when a frame's opcode matches a `text`/`binary` filter; any other
+/// filter value matches every frame.
+fn opcode_matches_type(opcode: i64, type_filter: &str) -> bool {
+    match type_filter.to_ascii_lowercase().as_str() {
+        "text" => opcode == 1,
+        "binary" => opcode == 2,
+        _ => true,
+    }
+}
+
+/// One socket as a summary row: identity, state, and frame counts, without the
+/// frame payloads. Use `network frames <socketId>` to read the payloads.
+fn socket_summary(sock: &TrackedSocket) -> Value {
+    let sent = sock.frames.iter().filter(|f| f.direction == "sent").count();
+    let received = sock
+        .frames
+        .iter()
+        .filter(|f| f.direction == "received")
+        .count();
+    json!({
+        "socketId": sock.socket_id,
+        "url": sock.url,
+        "state": if sock.closed { "closed" } else { "open" },
+        "createdAt": sock.created_at,
+        "frames": { "sent": sent, "received": received, "total": sock.frames.len() },
+        "error": sock.error,
+    })
+}
+
+/// Turn socket capture on and enable the CDP Network domain on the active
+/// session, once. Mirrors how request tracking starts lazily on first query.
+async fn ensure_socket_tracking(state: &mut DaemonState) {
+    if state.socket_tracking {
+        return;
+    }
+    state.socket_tracking = true;
+    if let Some(ref mgr) = state.browser {
+        if let Ok(session_id) = mgr.active_session_id() {
+            let _ = mgr
+                .client
+                .send_command_no_params("Network.enable", Some(session_id))
+                .await;
+        }
+    }
+}
+
+async fn handle_sockets(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    if cmd.get("clear").and_then(|v| v.as_bool()).unwrap_or(false) {
+        state.tracked_sockets.clear();
+        return Ok(json!({ "cleared": true }));
+    }
+
+    ensure_socket_tracking(state).await;
+
+    let filter = cmd.get("filter").and_then(|v| v.as_str());
+    let state_filter = cmd.get("state").and_then(|v| v.as_str());
+
+    let sockets: Vec<Value> = state
+        .tracked_sockets
+        .iter()
+        .filter(|s| {
+            if let Some(f) = filter {
+                if !s.url.contains(f) {
+                    return false;
+                }
+            }
+            match state_filter {
+                Some("open") => !s.closed,
+                Some("closed") => s.closed,
+                _ => true,
+            }
+        })
+        .map(socket_summary)
+        .collect();
+
+    Ok(json!({ "sockets": sockets }))
+}
+
+async fn handle_frames(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let socket_id = cmd
+        .get("socketId")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'socketId' parameter")?;
+
+    let sock = state
+        .tracked_sockets
+        .iter()
+        .find(|s| s.socket_id == socket_id)
+        .ok_or("Socket not found")?;
+
+    let direction = cmd.get("direction").and_then(|v| v.as_str());
+    let type_filter = cmd.get("type").and_then(|v| v.as_str());
+    let filter = cmd.get("filter").and_then(|v| v.as_str());
+
+    let frames: Vec<&SocketFrame> = sock
+        .frames
+        .iter()
+        .filter(|f| {
+            if let Some(d) = direction {
+                if !f.direction.eq_ignore_ascii_case(d) {
+                    return false;
+                }
+            }
+            if let Some(t) = type_filter {
+                if !opcode_matches_type(f.opcode, t) {
+                    return false;
+                }
+            }
+            if let Some(needle) = filter {
+                if !f.payload_data.contains(needle) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    Ok(json!({
+        "socketId": sock.socket_id,
+        "url": sock.url,
+        "state": if sock.closed { "closed" } else { "open" },
+        "frames": frames,
+    }))
+}
+
 async fn handle_http_credentials(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
@@ -8735,6 +9006,91 @@ mod tests {
             "agent-browser-{label}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn sample_socket() -> TrackedSocket {
+        TrackedSocket {
+            socket_id: "s1".to_string(),
+            url: "wss://example.com/chat".to_string(),
+            created_at: 0,
+            closed: false,
+            error: None,
+            frames: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn opcode_matches_type_filters_by_frame_kind() {
+        assert!(opcode_matches_type(1, "text"));
+        assert!(!opcode_matches_type(2, "text"));
+        assert!(opcode_matches_type(2, "binary"));
+        assert!(!opcode_matches_type(1, "binary"));
+        // Any other filter matches every opcode.
+        assert!(opcode_matches_type(8, "anything"));
+    }
+
+    #[test]
+    fn record_socket_frame_appends_to_matching_socket() {
+        let mut sockets = vec![sample_socket()];
+        let params = json!({
+            "requestId": "s1",
+            "response": { "opcode": 1, "payloadData": "hello" }
+        });
+        record_socket_frame(&mut sockets, &params, "sent");
+        assert_eq!(sockets[0].frames.len(), 1);
+        assert_eq!(sockets[0].frames[0].direction, "sent");
+        assert_eq!(sockets[0].frames[0].opcode, 1);
+        assert_eq!(sockets[0].frames[0].payload_data, "hello");
+    }
+
+    #[test]
+    fn record_socket_frame_ignores_unknown_socket() {
+        let mut sockets = vec![sample_socket()];
+        let params = json!({
+            "requestId": "other",
+            "response": { "opcode": 1, "payloadData": "hello" }
+        });
+        record_socket_frame(&mut sockets, &params, "received");
+        assert!(sockets[0].frames.is_empty());
+    }
+
+    #[test]
+    fn record_socket_frame_caps_buffer_dropping_oldest() {
+        let mut sockets = vec![sample_socket()];
+        for i in 0..(MAX_SOCKET_FRAMES + 5) {
+            let params = json!({
+                "requestId": "s1",
+                "response": { "opcode": 1, "payloadData": i.to_string() }
+            });
+            record_socket_frame(&mut sockets, &params, "received");
+        }
+        assert_eq!(sockets[0].frames.len(), MAX_SOCKET_FRAMES);
+        // The five oldest frames were dropped, so the buffer starts at "5".
+        assert_eq!(sockets[0].frames[0].payload_data, "5");
+    }
+
+    #[test]
+    fn socket_summary_reports_counts_and_state() {
+        let mut sock = sample_socket();
+        sock.frames.push(SocketFrame {
+            direction: "sent",
+            opcode: 1,
+            payload_data: "a".to_string(),
+            timestamp: 0,
+        });
+        sock.frames.push(SocketFrame {
+            direction: "received",
+            opcode: 1,
+            payload_data: "b".to_string(),
+            timestamp: 0,
+        });
+        sock.closed = true;
+        let summary = socket_summary(&sock);
+        assert_eq!(summary["socketId"], "s1");
+        assert_eq!(summary["state"], "closed");
+        assert_eq!(summary["frames"]["sent"], 1);
+        assert_eq!(summary["frames"]["received"], 1);
+        assert_eq!(summary["frames"]["total"], 2);
     }
 
     #[test]
