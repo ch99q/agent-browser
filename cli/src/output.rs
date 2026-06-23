@@ -2044,7 +2044,7 @@ agent-browser network - Network interception and monitoring
 
 Usage: agent-browser network <subcommand> [args]
 
-Intercept, mock, or monitor network requests.
+Intercept, mock, or monitor network requests and WebSocket traffic.
 
 Subcommands:
   route <url> [options]      Intercept requests matching URL pattern
@@ -2058,6 +2058,14 @@ Subcommands:
     --method <method>        Filter by HTTP method (GET, POST, etc.)
     --status <code>          Filter by status (200, 2xx, 400-499)
   request <requestId>        View full request/response detail (including body)
+  sockets [options]          List captured WebSocket connections
+    --clear                  Clear the captured socket log
+    --filter <pattern>       Filter by URL substring
+    --state <open|closed>    Filter by connection state
+  frames <socketId> [opts]   List captured frames for one WebSocket
+    --direction <dir>        Filter by direction (sent, received)
+    --type <kind>            Filter by frame kind (text, binary)
+    --filter <substring>     Filter by payload substring
   har <start|stop> [path]    Record and export a HAR file
 
 Global Options:
@@ -2074,6 +2082,10 @@ Examples:
   agent-browser network requests --method POST --status 2xx
   agent-browser network requests --clear
   agent-browser network request 1234.5
+  agent-browser network sockets
+  agent-browser network sockets --filter wss://data --state open
+  agent-browser network frames 62270.358
+  agent-browser network frames 62270.358 --direction received --type text
   agent-browser network har start
   agent-browser network har stop ./capture.har
 "##

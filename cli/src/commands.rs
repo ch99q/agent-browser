@@ -2668,7 +2668,9 @@ fn parse_set(rest: &[&str], id: &str) -> Result<Value, ParseError> {
 
 /// Parse network interception, request inspection, and HAR recording commands.
 fn parse_network(rest: &[&str], id: &str) -> Result<Value, ParseError> {
-    const VALID: &[&str] = &["route", "unroute", "requests", "request", "har"];
+    const VALID: &[&str] = &[
+        "route", "unroute", "requests", "request", "har", "sockets", "frames",
+    ];
 
     match rest.first().copied() {
         Some("route") => {
@@ -2752,13 +2754,51 @@ fn parse_network(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                 }),
             }
         }
+        Some("sockets") => {
+            let clear = rest.contains(&"--clear");
+            let filter_idx = rest.iter().position(|&s| s == "--filter");
+            let filter = filter_idx.and_then(|i| rest.get(i + 1).copied());
+            let state_idx = rest.iter().position(|&s| s == "--state");
+            let state = state_idx.and_then(|i| rest.get(i + 1).copied());
+            let mut cmd = json!({ "id": id, "action": "sockets", "clear": clear });
+            if let Some(f) = filter {
+                cmd["filter"] = json!(f);
+            }
+            if let Some(s) = state {
+                cmd["state"] = json!(s);
+            }
+            Ok(cmd)
+        }
+        Some("frames") => {
+            let socket_id = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+                context: "network frames".to_string(),
+                usage: "network frames <socketId> [--direction <sent|received>] [--type <text|binary>] [--filter <substring>]",
+            })?;
+            let direction_idx = rest.iter().position(|&s| s == "--direction");
+            let direction = direction_idx.and_then(|i| rest.get(i + 1).copied());
+            let type_idx = rest.iter().position(|&s| s == "--type");
+            let ftype = type_idx.and_then(|i| rest.get(i + 1).copied());
+            let filter_idx = rest.iter().position(|&s| s == "--filter");
+            let filter = filter_idx.and_then(|i| rest.get(i + 1).copied());
+            let mut cmd = json!({ "id": id, "action": "frames", "socketId": socket_id });
+            if let Some(d) = direction {
+                cmd["direction"] = json!(d);
+            }
+            if let Some(t) = ftype {
+                cmd["type"] = json!(t);
+            }
+            if let Some(f) = filter {
+                cmd["filter"] = json!(f);
+            }
+            Ok(cmd)
+        }
         Some(sub) => Err(ParseError::UnknownSubcommand {
             subcommand: sub.to_string(),
             valid_options: VALID,
         }),
         None => Err(ParseError::MissingArguments {
             context: "network".to_string(),
-            usage: "network <route|unroute|requests|request|har> [args...]",
+            usage: "network <route|unroute|requests|request|har|sockets|frames> [args...]",
         }),
     }
 }
@@ -3775,6 +3815,52 @@ mod tests {
     #[test]
     fn test_network_request_detail_requires_id() {
         let result = parse_command(&args("network request"), &default_flags());
+        assert!(matches!(result, Err(ParseError::MissingArguments { .. })));
+    }
+
+    #[test]
+    fn test_network_sockets() {
+        let cmd = parse_command(&args("network sockets"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "sockets");
+        assert_eq!(cmd["clear"], false);
+    }
+
+    #[test]
+    fn test_network_sockets_filters() {
+        let cmd = parse_command(
+            &args("network sockets --filter chat --state open"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "sockets");
+        assert_eq!(cmd["filter"], "chat");
+        assert_eq!(cmd["state"], "open");
+    }
+
+    #[test]
+    fn test_network_sockets_clear() {
+        let cmd = parse_command(&args("network sockets --clear"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "sockets");
+        assert_eq!(cmd["clear"], true);
+    }
+
+    #[test]
+    fn test_network_frames() {
+        let cmd = parse_command(
+            &args("network frames 12.3 --direction received --type text --filter ping"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "frames");
+        assert_eq!(cmd["socketId"], "12.3");
+        assert_eq!(cmd["direction"], "received");
+        assert_eq!(cmd["type"], "text");
+        assert_eq!(cmd["filter"], "ping");
+    }
+
+    #[test]
+    fn test_network_frames_requires_id() {
+        let result = parse_command(&args("network frames"), &default_flags());
         assert!(matches!(result, Err(ParseError::MissingArguments { .. })));
     }
 
