@@ -297,7 +297,7 @@ agent-browser network requests --method POST   # Filter by HTTP method
 agent-browser network requests --status 2xx    # Filter by status (200, 2xx, 400-499)
 agent-browser network request <requestId>      # View full request/response detail
 agent-browser network sockets                  # List captured WebSocket connections
-agent-browser network sockets --filter wss://data --state open  # Filter sockets
+agent-browser network sockets --filter wss://data --status open  # Filter sockets
 agent-browser network frames <socketId>        # List frames for one WebSocket
 agent-browser network frames <socketId> --direction received --type text  # Filter frames
 agent-browser network frames <socketId> --tail 20            # Most recent 20 frames

@@ -2061,7 +2061,7 @@ Subcommands:
   sockets [options]          List captured WebSocket connections
     --clear                  Clear the captured socket log
     --filter <terms>         Filter by URL (comma-separated regex/substring terms, OR)
-    --state <open|closed>    Filter by connection state
+    --status <open|closed>   Filter by connection state
   frames <socketId> [opts]   List captured frames for one WebSocket
     --direction <dir>        Filter by direction (sent, received)
     --type <kind>            Filter by frame kind (text, binary)
@@ -2086,7 +2086,7 @@ Examples:
   agent-browser network requests --clear
   agent-browser network request 1234.5
   agent-browser network sockets
-  agent-browser network sockets --filter wss://data --state open
+  agent-browser network sockets --filter wss://data --status open
   agent-browser network frames 62270.358
   agent-browser network frames 62270.358 --direction received --type text
   agent-browser network frames 62270.358 --tail 20

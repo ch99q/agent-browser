@@ -8100,7 +8100,7 @@ async fn handle_sockets(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         .get("filter")
         .and_then(|v| v.as_str())
         .map(parse_filter_terms);
-    let state_filter = cmd.get("state").and_then(|v| v.as_str());
+    let status_filter = cmd.get("status").and_then(|v| v.as_str());
 
     let sockets: Vec<Value> = state
         .tracked_sockets
@@ -8111,7 +8111,7 @@ async fn handle_sockets(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
                     return false;
                 }
             }
-            match state_filter {
+            match status_filter {
                 Some("open") => !s.closed,
                 Some("closed") => s.closed,
                 _ => true,

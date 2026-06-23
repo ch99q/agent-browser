@@ -984,6 +984,36 @@ mod tests {
     }
 
     #[test]
+    fn clean_args_preserves_network_socket_flags() {
+        // The socket/frame query flags must survive global-flag stripping.
+        let cleaned = clean_args(&args("network sockets --filter chat --status open"));
+        assert!(cleaned.contains(&"--status".to_string()));
+        assert!(cleaned.contains(&"open".to_string()));
+
+        let cleaned = clean_args(&args(
+            "network frames 12.3 --tail 20 --limit 5 --offset 2 --direction sent",
+        ));
+        for token in [
+            "--tail",
+            "20",
+            "--limit",
+            "5",
+            "--offset",
+            "2",
+            "--direction",
+            "sent",
+        ] {
+            assert!(cleaned.contains(&token.to_string()), "stripped: {token}");
+        }
+
+        // Regression guard: `--state` is a global flag (load saved storage
+        // state), so it is stripped before the command parser. Socket state
+        // filtering must use `--status` instead.
+        let cleaned = clean_args(&args("network sockets --state open"));
+        assert!(!cleaned.contains(&"--state".to_string()));
+    }
+
+    #[test]
     fn test_parse_idle_timeout_raw_ms() {
         assert_eq!(parse_idle_timeout("10").unwrap(), "10");
     }

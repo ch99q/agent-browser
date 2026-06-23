@@ -2758,14 +2758,16 @@ fn parse_network(rest: &[&str], id: &str) -> Result<Value, ParseError> {
             let clear = rest.contains(&"--clear");
             let filter_idx = rest.iter().position(|&s| s == "--filter");
             let filter = filter_idx.and_then(|i| rest.get(i + 1).copied());
-            let state_idx = rest.iter().position(|&s| s == "--state");
-            let state = state_idx.and_then(|i| rest.get(i + 1).copied());
+            // `--status`, not `--state`: `--state` is a global flag that loads a
+            // saved storage-state file and is stripped before this parser runs.
+            let status_idx = rest.iter().position(|&s| s == "--status");
+            let status = status_idx.and_then(|i| rest.get(i + 1).copied());
             let mut cmd = json!({ "id": id, "action": "sockets", "clear": clear });
             if let Some(f) = filter {
                 cmd["filter"] = json!(f);
             }
-            if let Some(s) = state {
-                cmd["state"] = json!(s);
+            if let Some(s) = status {
+                cmd["status"] = json!(s);
             }
             Ok(cmd)
         }
@@ -3842,13 +3844,13 @@ mod tests {
     #[test]
     fn test_network_sockets_filters() {
         let cmd = parse_command(
-            &args("network sockets --filter chat --state open"),
+            &args("network sockets --filter chat --status open"),
             &default_flags(),
         )
         .unwrap();
         assert_eq!(cmd["action"], "sockets");
         assert_eq!(cmd["filter"], "chat");
-        assert_eq!(cmd["state"], "open");
+        assert_eq!(cmd["status"], "open");
     }
 
     #[test]

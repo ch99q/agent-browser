@@ -185,7 +185,7 @@ agent-browser network unroute [url]            # Remove routes
 agent-browser network requests                 # View tracked requests
 agent-browser network requests --filter api    # Filter requests
 agent-browser network sockets                  # List captured WebSocket connections
-agent-browser network sockets --state open     # Filter sockets by state
+agent-browser network sockets --status open    # Filter sockets by state
 agent-browser network frames <socketId>        # List frames for one WebSocket
 agent-browser network frames <socketId> --direction received --type text
 agent-browser network frames <socketId> --tail 20             # Most recent n frames

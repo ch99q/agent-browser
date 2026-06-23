@@ -1134,7 +1134,7 @@ fn parity_tools() -> Vec<Value> {
             TOOL_NETWORK_SOCKETS,
             "WebSocket connections",
             "List captured WebSocket connections. Enables capture on first call; reconnect or act on the page to populate it.",
-            json!({ "clear": { "type": "boolean" }, "filter": { "type": "string", "description": "Match the socket URL. Comma-separated terms (OR); each term is a regex, falling back to a substring when not valid regex." }, "state": { "type": "string", "enum": ["open", "closed"] } }),
+            json!({ "clear": { "type": "boolean" }, "filter": { "type": "string", "description": "Match the socket URL. Comma-separated terms (OR); each term is a regex, falling back to a substring when not valid regex." }, "status": { "type": "string", "enum": ["open", "closed"], "description": "Filter by connection state." } }),
             &[],
         ),
         tool(
@@ -2649,7 +2649,7 @@ fn call_network_sockets(arguments: &Value) -> Result<Value, ProtocolError> {
     if optional_bool(arguments, "clear")?.unwrap_or(false) {
         args.push("--clear".to_string());
     }
-    for (key, flag) in [("filter", "--filter"), ("state", "--state")] {
+    for (key, flag) in [("filter", "--filter"), ("status", "--status")] {
         if let Some(value) = optional_string(arguments, key)? {
             args.push(flag.to_string());
             args.push(value);

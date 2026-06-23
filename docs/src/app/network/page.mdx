@@ -63,7 +63,7 @@ Use `network request <requestId>` to inspect one request and response in detail 
 agent-browser open https://app.example.com
 agent-browser network sockets
 agent-browser click @e4
-agent-browser network sockets --state open
+agent-browser network sockets --status open
 agent-browser network frames <socketId> --direction received --type text
 agent-browser network frames <socketId> --tail 20
 agent-browser network frames <socketId> --filter "quote_create,set_auth"
@@ -78,7 +78,7 @@ Each connection has a `socketId` that ties its frames together. `network sockets
   <tbody>
     <tr><td><code>network sockets</code></td><td>List captured WebSocket connections</td></tr>
     <tr><td><code>network sockets --filter &lt;terms&gt;</code></td><td>Filter sockets by URL</td></tr>
-    <tr><td><code>network sockets --state &lt;open|closed&gt;</code></td><td>Filter sockets by connection state</td></tr>
+    <tr><td><code>network sockets --status &lt;open|closed&gt;</code></td><td>Filter sockets by connection state</td></tr>
     <tr><td><code>network sockets --clear</code></td><td>Clear the captured socket log</td></tr>
     <tr><td><code>network frames &lt;socketId&gt;</code></td><td>List frames for one connection</td></tr>
     <tr><td><code>network frames &lt;socketId&gt; --direction &lt;sent|received&gt;</code></td><td>Filter frames by direction</td></tr>

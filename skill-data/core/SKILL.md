@@ -304,7 +304,7 @@ agent-browser network har stop /tmp/trace.har
 ```bash
 agent-browser network sockets                  # enable capture, list connections
 # ... act on the page so sockets open and stream ...
-agent-browser network sockets --state open     # only live connections
+agent-browser network sockets --status open    # only live connections
 agent-browser network frames <socketId>        # read frames for one connection
 agent-browser network frames <socketId> --direction received --type text
 agent-browser network frames <socketId> --tail 20             # most recent 20
