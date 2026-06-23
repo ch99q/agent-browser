@@ -307,9 +307,11 @@ agent-browser network sockets                  # enable capture, list connection
 agent-browser network sockets --state open     # only live connections
 agent-browser network frames <socketId>        # read frames for one connection
 agent-browser network frames <socketId> --direction received --type text
+agent-browser network frames <socketId> --tail 20             # most recent 20
+agent-browser network frames <socketId> --filter "quote,auth" # match either term
 ```
 
-Capture starts on the first `network sockets` call, so run it before the socket opens (or reconnect afterward). Each connection has a `socketId`; pass it to `network frames` to read the payloads.
+Capture starts on the first `network sockets` call, so run it before the socket opens (or reconnect afterward). Each connection has a `socketId`; pass it to `network frames` to read the payloads. `--filter` takes comma-separated terms (OR), each a regex with substring fallback. Use `--tail`, `--limit`, and `--offset` to read a slice of a busy socket instead of every frame; the response carries a `total` count.
 
 ### Record a video of the workflow
 

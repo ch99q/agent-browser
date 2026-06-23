@@ -188,6 +188,9 @@ agent-browser network sockets                  # List captured WebSocket connect
 agent-browser network sockets --state open     # Filter sockets by state
 agent-browser network frames <socketId>        # List frames for one WebSocket
 agent-browser network frames <socketId> --direction received --type text
+agent-browser network frames <socketId> --tail 20             # Most recent n frames
+agent-browser network frames <socketId> --limit 50 --offset 100  # Page through frames
+agent-browser network frames <socketId> --filter "quote,auth"    # Comma terms (OR), each a regex
 ```
 
 ## Tabs and Windows

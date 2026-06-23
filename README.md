@@ -300,6 +300,9 @@ agent-browser network sockets                  # List captured WebSocket connect
 agent-browser network sockets --filter wss://data --state open  # Filter sockets
 agent-browser network frames <socketId>        # List frames for one WebSocket
 agent-browser network frames <socketId> --direction received --type text  # Filter frames
+agent-browser network frames <socketId> --tail 20            # Most recent 20 frames
+agent-browser network frames <socketId> --limit 50 --offset 100  # Page through frames
+agent-browser network frames <socketId> --filter "quote,auth"    # Match either term
 agent-browser network har start                # Start HAR recording
 agent-browser network har stop [output.har]    # Stop and save HAR (temp path if omitted)
 ```
@@ -307,6 +310,11 @@ agent-browser network har stop [output.har]    # Stop and save HAR (temp path if
 Socket capture starts the first time you run `network sockets`, so connections that
 were already open before that call are not captured. Run it once, then act on the page
 (or reconnect) to populate the log, the same way request tracking works.
+
+`--filter` takes comma-separated terms and matches if any one matches. Each term is a
+regular expression, falling back to a plain substring when it is not valid regex.
+`network frames` returns a `total` count (after filters, before the range window), so
+`--tail`, `--limit`, and `--offset` let you read a slice of a busy socket instead of every frame.
 
 ### Tabs & Windows
 

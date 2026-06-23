@@ -196,6 +196,7 @@ agent-browser network sockets                  # List captured WebSocket connect
 agent-browser network sockets --state open     # Filter sockets by state
 agent-browser network frames <socketId>        # List frames for one WebSocket
 agent-browser network frames <socketId> --direction received --type text  # Filter frames
+agent-browser network frames <socketId> --tail 20  # Most recent n frames (or --limit/--offset)
 agent-browser network har start                # Start HAR recording
 agent-browser network har stop [output.har]    # Stop and save HAR (temp path if omitted)
 ```
