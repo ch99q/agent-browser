@@ -89,6 +89,11 @@ URL: https://example.com/login
 For unstructured reading (no refs needed):
 
 ```bash
+agent-browser read                         # read rendered active-tab DOM
+agent-browser read https://docs.example.com/guide  # docs-friendly fetch, prefers markdown
+agent-browser read https://docs.example.com/guide --filter auth  # one matching section
+agent-browser read https://docs.example.com/guide --outline  # compact page headings
+agent-browser read https://docs.example.com --llms index --filter auth  # compact llms.txt discovery
 agent-browser get text @e1                # visible text of an element
 agent-browser get html @e1                # innerHTML
 agent-browser get attr @e1 href           # any attribute
@@ -97,6 +102,8 @@ agent-browser get title                   # page title
 agent-browser get url                     # current URL
 agent-browser get count ".item"           # count matching elements
 ```
+
+Use `read [url]` when you need to consume documentation or other text pages rather than interact with a rendered UI. Omit the URL to read the rendered DOM of the active tab in the current browser session, including browser auth state and client-side updates. Explicit URL reads send `Accept: text/markdown`, try the same URL with `.md` appended when the first response is not markdown, walk ancestor paths toward `/` to find the nearest `llms.txt` for a matching docs link, print markdown/plain text when available, and fall back to readable text extracted from HTML without launching Chrome. Add `--filter <text>` to narrow a page to matching heading sections, `--outline` for compact headings on one page, `--llms index` for a compact nearest-ancestor `llms.txt` link list, and `--llms full` only when you explicitly need `llms-full.txt`. With `--llms` or `--require-md`, omitting the URL uses the active tab URL because those modes depend on HTTP resources. With `--llms` or `--outline`, `--filter <text>` narrows links, sections, or headings. Add `--require-md` when you specifically want to verify markdown negotiation, `--raw` when you need the response body unchanged, and `--json` when you need metadata such as `source` and `contentType`. Global safeguards such as `--allowed-domains`, `--content-boundaries`, and `--max-output` also apply to read fetches and output.
 
 ## Interacting
 
@@ -214,18 +221,18 @@ agent-browser plugin run captcha captcha.solve --payload '{"siteKey":"...","url"
 ### Persist session across runs
 
 ```bash
-# Log in once, save cookies + localStorage
-agent-browser state save ./auth.json
+# Derive one stable id for this agent/worktree
+SESSION="$(agent-browser session id --scope worktree --prefix my-app)"
 
-# Later runs start already-logged-in
-agent-browser --state ./auth.json open https://app.example.com
+# Pass the same id and restore request on every command
+agent-browser --session "$SESSION" --restore open https://app.example.com
 ```
 
-Or use `--session-name` for auto-save/restore:
+`--restore` with no value uses the current `--session` as the persistence key. Agent skills should prefer this over hand-built state file paths. Use `--restore-save auto` by default so a failed restore does not overwrite the previous known-good state.
 
 ```bash
-AGENT_BROWSER_SESSION_NAME=my-app agent-browser open https://app.example.com
-# State is auto-saved and restored on subsequent runs with the same name.
+agent-browser --session "$SESSION" --restore --restore-check-text Dashboard open https://app.example.com
+agent-browser --session "$SESSION" session info --json
 ```
 
 ### Extract data
@@ -277,7 +284,7 @@ Stable `tabId`s mean `t2` points at the same tab across commands even when other
 
 ### Run multiple browsers in parallel
 
-Each `--session <name>` is an isolated browser with its own cookies, tabs, and refs. Useful for testing multi-user flows or parallel scraping:
+Each `--session <name>` is an isolated browser with its own cookies, tabs, and refs. For agent skills, derive stable names with `agent-browser session id --scope worktree --prefix <skill>`. Useful for testing multi-user flows or parallel scraping:
 
 ```bash
 agent-browser --session a open https://app.example.com
@@ -407,7 +414,7 @@ EOF
 
 **Cross-origin iframe not accessible** Cross-origin iframes that block accessibility tree access are silently skipped. Use `frame "#iframe"` to switch into them explicitly if the parent opts in, otherwise the iframe's contents aren't available via snapshot — fall back to `eval` in the iframe's origin or use the `--headers` flag to satisfy CORS.
 
-**Authentication expires mid-workflow** Use `--session-name <name>` or `state save`/`state load` so your session survives browser restarts. See [references/session-management.md](references/session-management.md) and [references/authentication.md](references/authentication.md).
+**Authentication expires mid-workflow** Use `--session <id> --restore` so your session survives browser restarts. Check `agent-browser session info --json` if restore fails. See [references/session-management.md](references/session-management.md) and [references/authentication.md](references/authentication.md).
 
 ## Global flags worth knowing
 
@@ -421,7 +428,9 @@ EOF
 --headers <json>        # HTTP headers scoped to the URL's origin
 --proxy <url>           # proxy server
 --state <path>          # load saved auth state from JSON
---session-name <name>   # auto-save/restore session state by name
+--restore [name]        # auto-save/restore session state, defaults to --session
+--restore-save <policy> # auto, always, or never
+--namespace <name>      # isolate daemon sockets and restore-state directories
 ```
 
 ## When to load another skill

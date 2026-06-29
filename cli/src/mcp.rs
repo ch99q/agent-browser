@@ -19,6 +19,7 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const TOOL_LIST_PAGE_SIZE: usize = 64;
 const TOOL_OPEN: &str = "agent_browser_open";
+const TOOL_READ: &str = "agent_browser_read";
 const TOOL_BACK: &str = "agent_browser_back";
 const TOOL_FORWARD: &str = "agent_browser_forward";
 const TOOL_RELOAD: &str = "agent_browser_reload";
@@ -151,6 +152,8 @@ const TOOL_STREAM_DISABLE: &str = "agent_browser_stream_disable";
 const TOOL_STREAM_STATUS: &str = "agent_browser_stream_status";
 const TOOL_SESSION: &str = "agent_browser_session";
 const TOOL_SESSION_LIST: &str = "agent_browser_session_list";
+const TOOL_SESSION_ID: &str = "agent_browser_session_id";
+const TOOL_SESSION_INFO: &str = "agent_browser_session_info";
 const TOOL_PROFILES: &str = "agent_browser_profiles";
 const TOOL_SKILLS_LIST: &str = "agent_browser_skills_list";
 const TOOL_SKILLS_GET: &str = "agent_browser_skills_get";
@@ -324,6 +327,7 @@ impl Default for McpConfig {
 const CORE_PROFILE_TOOLS: &[&str] = &[
     TOOL_TOOLS_PROFILES,
     TOOL_OPEN,
+    TOOL_READ,
     TOOL_SNAPSHOT,
     TOOL_BACK,
     TOOL_FORWARD,
@@ -388,6 +392,8 @@ const STATE_PROFILE_TOOLS: &[&str] = &[
     TOOL_STATE_RENAME,
     TOOL_SESSION,
     TOOL_SESSION_LIST,
+    TOOL_SESSION_ID,
+    TOOL_SESSION_INFO,
     TOOL_PROFILES,
     TOOL_SKILLS_LIST,
     TOOL_SKILLS_GET,
@@ -748,6 +754,21 @@ fn tools() -> Vec<Value> {
             json!({
                 "url": { "type": "string", "description": "URL to open. Omit to launch about:blank." },
                 "headed": { "type": "boolean", "default": false, "description": "Show the browser window." }
+            }),
+            &[],
+        ),
+        tool(
+            TOOL_READ,
+            "Read URL",
+            "Fetch a URL as agent-readable text, preferring text/markdown. Omit url to read the active tab.",
+            json!({
+                "url": { "type": "string", "description": "URL to read. Bare hosts are normalized to https. Omit to read the active tab." },
+                "raw": { "type": "boolean", "description": "Return the response body without HTML extraction." },
+                "requireMd": { "type": "boolean", "description": "Fail unless the response is Content-Type: text/markdown." },
+                "llms": { "type": "string", "enum": ["index", "full"], "description": "Return nearest-ancestor llms data: index for compact llms.txt links, full for llms-full.txt." },
+                "outline": { "type": "boolean", "description": "Return a heading outline for the selected page instead of the full page text." },
+                "filter": { "type": "string", "description": "Filter page sections, --llms links/sections, or --outline headings." },
+                "readTimeoutMs": { "type": "integer", "description": "Request timeout in milliseconds." }
             }),
             &[],
         ),
@@ -1630,6 +1651,23 @@ fn parity_tools() -> Vec<Value> {
             &[],
         ),
         tool(
+            TOOL_SESSION_ID,
+            "Session id",
+            "Generate a stable session id from the current working tree, cwd, or Git root.",
+            json!({
+                "scope": { "type": "string", "enum": ["worktree", "cwd", "git-root"], "default": "worktree" },
+                "prefix": { "type": "string", "description": "Optional readable prefix for the generated id." }
+            }),
+            &[],
+        ),
+        tool(
+            TOOL_SESSION_INFO,
+            "Session info",
+            "Show session, daemon, launch, and restore diagnostics.",
+            json!({}),
+            &[],
+        ),
+        tool(
             TOOL_PROFILES,
             "Profiles",
             "List Chrome profiles.",
@@ -1807,6 +1845,52 @@ fn tool(name: &str, title: &str, description: &str, properties: Value, required:
         }),
     );
     props.insert(
+        "namespace".to_string(),
+        json!({
+            "type": "string",
+            "description": "Optional namespace that isolates daemon sockets and restore-state directories."
+        }),
+    );
+    props.insert(
+        "restore".to_string(),
+        json!({
+            "oneOf": [
+                { "type": "boolean" },
+                { "type": "string" }
+            ],
+            "description": "Restore and auto-save browser state. true uses the current session as the key; a string uses that explicit key."
+        }),
+    );
+    props.insert(
+        "restoreSave".to_string(),
+        json!({
+            "type": "string",
+            "enum": ["auto", "always", "never"],
+            "description": "Auto-save policy for restored state."
+        }),
+    );
+    props.insert(
+        "restoreCheckUrl".to_string(),
+        json!({
+            "type": "string",
+            "description": "Optional URL pattern that restored state must match."
+        }),
+    );
+    props.insert(
+        "restoreCheckText".to_string(),
+        json!({
+            "type": "string",
+            "description": "Optional page text that restored state must expose."
+        }),
+    );
+    props.insert(
+        "restoreCheckFn".to_string(),
+        json!({
+            "type": "string",
+            "description": "Optional JavaScript expression that must evaluate truthy after restore."
+        }),
+    );
+    props.insert(
         "extraArgs".to_string(),
         json!({
             "type": "array",
@@ -1852,6 +1936,7 @@ fn is_read_only_tool(name: &str) -> bool {
     matches!(
         name,
         TOOL_SNAPSHOT
+            | TOOL_READ
             | TOOL_WAIT_MS
             | TOOL_WAIT_FOR_SELECTOR
             | TOOL_WAIT_FOR_TEXT
@@ -1890,6 +1975,8 @@ fn is_read_only_tool(name: &str) -> bool {
             | TOOL_STREAM_STATUS
             | TOOL_SESSION
             | TOOL_SESSION_LIST
+            | TOOL_SESSION_ID
+            | TOOL_SESSION_INFO
             | TOOL_PROFILES
             | TOOL_SKILLS_LIST
             | TOOL_SKILLS_GET
@@ -1904,6 +1991,8 @@ fn is_open_world_tool(name: &str) -> bool {
         name,
         TOOL_SESSION
             | TOOL_SESSION_LIST
+            | TOOL_SESSION_ID
+            | TOOL_SESSION_INFO
             | TOOL_PROFILES
             | TOOL_SKILLS_LIST
             | TOOL_SKILLS_GET
@@ -1971,6 +2060,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
     match name {
         TOOL_TOOLS_PROFILES => call_tools_profiles(config),
         TOOL_OPEN => call_open(arguments),
+        TOOL_READ => call_read(arguments),
         TOOL_SNAPSHOT => call_snapshot(arguments),
         TOOL_CLICK => call_click(arguments),
         TOOL_BACK => call_literal(arguments, &["back"]),
@@ -2111,6 +2201,8 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_STREAM_STATUS => call_literal(arguments, &["stream", "status"]),
         TOOL_SESSION => call_literal(arguments, &["session"]),
         TOOL_SESSION_LIST => call_literal(arguments, &["session", "list"]),
+        TOOL_SESSION_ID => call_session_id(arguments),
+        TOOL_SESSION_INFO => call_literal(arguments, &["session", "info"]),
         TOOL_PROFILES => call_literal(arguments, &["profiles"]),
         TOOL_SKILLS_LIST => call_literal(arguments, &["skills", "list"]),
         TOOL_SKILLS_GET => call_skills_get(arguments),
@@ -2179,7 +2271,7 @@ fn call_cli_tool(
     let extra_args = optional_string_array(arguments, "extraArgs")?.unwrap_or_default();
 
     let mut cli_args = vec!["--json".to_string()];
-    append_session_args(&mut cli_args, session.as_deref());
+    append_common_global_args(&mut cli_args, arguments, session.as_deref())?;
     cli_args.extend(command_args);
     cli_args.extend(extra_args);
 
@@ -2244,6 +2336,35 @@ fn call_open(arguments: &Value) -> Result<Value, ProtocolError> {
         if !url.is_empty() {
             args.push(url);
         }
+    }
+    call_cli_tool(arguments, args, None)
+}
+
+fn call_read(arguments: &Value) -> Result<Value, ProtocolError> {
+    let mut args = vec!["read".to_string()];
+    if optional_bool(arguments, "raw")?.unwrap_or(false) {
+        args.push("--raw".to_string());
+    }
+    if optional_bool(arguments, "requireMd")?.unwrap_or(false) {
+        args.push("--require-md".to_string());
+    }
+    if let Some(llms) = optional_string(arguments, "llms")? {
+        args.push("--llms".to_string());
+        args.push(llms);
+    }
+    if optional_bool(arguments, "outline")?.unwrap_or(false) {
+        args.push("--outline".to_string());
+    }
+    if let Some(filter) = optional_string(arguments, "filter")? {
+        args.push("--filter".to_string());
+        args.push(filter);
+    }
+    if let Some(timeout) = optional_u64(arguments, "readTimeoutMs")? {
+        args.push("--timeout".to_string());
+        args.push(timeout.to_string());
+    }
+    if let Some(url) = optional_string(arguments, "url")? {
+        args.push(url);
     }
     call_cli_tool(arguments, args, None)
 }
@@ -2871,6 +2992,23 @@ fn call_state_rename(arguments: &Value) -> Result<Value, ProtocolError> {
     )
 }
 
+fn call_session_id(arguments: &Value) -> Result<Value, ProtocolError> {
+    let mut args = vec![
+        "session".to_string(),
+        "id".to_string(),
+        "--json".to_string(),
+    ];
+    if let Some(scope) = optional_string(arguments, "scope")? {
+        args.push("--scope".to_string());
+        args.push(scope);
+    }
+    if let Some(prefix) = optional_string(arguments, "prefix")? {
+        args.push("--prefix".to_string());
+        args.push(prefix);
+    }
+    call_cli_tool(arguments, args, None)
+}
+
 fn call_swipe(arguments: &Value) -> Result<Value, ProtocolError> {
     let direction = required_string(arguments, "direction")?;
     let mut args = vec!["swipe".to_string(), direction];
@@ -3340,6 +3478,51 @@ fn append_session_args(args: &mut Vec<String>, session: Option<&str>) {
     }
 }
 
+fn append_common_global_args(
+    args: &mut Vec<String>,
+    arguments: &Value,
+    session: Option<&str>,
+) -> Result<(), ProtocolError> {
+    if let Some(namespace) = optional_string(arguments, "namespace")? {
+        args.push("--namespace".to_string());
+        args.push(namespace);
+    }
+    append_session_args(args, session);
+
+    if let Some(restore) = arguments.get("restore") {
+        if let Some(enabled) = restore.as_bool() {
+            if enabled {
+                args.push("--restore".to_string());
+            }
+        } else if let Some(key) = restore.as_str() {
+            args.push(format!("--restore={}", key));
+        } else {
+            return Err(ProtocolError::invalid_params(
+                "restore must be a boolean or string",
+            ));
+        }
+    }
+
+    if let Some(policy) = optional_string(arguments, "restoreSave")? {
+        args.push("--restore-save".to_string());
+        args.push(policy);
+    }
+    if let Some(check) = optional_string(arguments, "restoreCheckUrl")? {
+        args.push("--restore-check-url".to_string());
+        args.push(check);
+    }
+    if let Some(check) = optional_string(arguments, "restoreCheckText")? {
+        args.push("--restore-check-text".to_string());
+        args.push(check);
+    }
+    if let Some(check) = optional_string(arguments, "restoreCheckFn")? {
+        args.push("--restore-check-fn".to_string());
+        args.push(check);
+    }
+
+    Ok(())
+}
+
 fn run_cli(args: &[String], stdin_body: Option<String>, timeout_ms: u64) -> Result<CliRun, String> {
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let mut command = Command::new(exe);
@@ -3498,7 +3681,7 @@ fn response_text(value: &Value) -> Option<String> {
 
         if let Some(data) = obj.get("data") {
             for key in [
-                "snapshot", "text", "html", "report", "value", "title", "url", "path",
+                "snapshot", "text", "html", "report", "value", "content", "title", "url", "path",
             ] {
                 if let Some(s) = data.get(key).and_then(|v| v.as_str()) {
                     return Some(s.to_string());
@@ -3569,6 +3752,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&TOOL_TOOLS_PROFILES));
         assert!(names.contains(&TOOL_OPEN));
+        assert!(names.contains(&TOOL_READ));
         assert!(names.contains(&TOOL_SNAPSHOT));
         assert!(names.contains(&TOOL_CLICK));
         assert!(names.contains(&TOOL_SCREENSHOT));
@@ -3580,6 +3764,8 @@ mod tests {
         assert!(names.contains(&TOOL_PLUGIN_LIST));
         assert!(names.contains(&TOOL_PLUGIN_SHOW));
         assert!(names.contains(&TOOL_PLUGIN_RUN));
+        assert!(names.contains(&TOOL_SESSION_ID));
+        assert!(names.contains(&TOOL_SESSION_INFO));
         assert!(!names.contains(&"agent_browser_frame_list"));
     }
 
@@ -3639,6 +3825,7 @@ mod tests {
 
         assert!(names.contains(&TOOL_TOOLS_PROFILES));
         assert!(names.contains(&TOOL_OPEN));
+        assert!(names.contains(&TOOL_READ));
         assert!(names.contains(&TOOL_SNAPSHOT));
         assert!(names.contains(&TOOL_CLICK));
         assert!(names.contains(&TOOL_SCREENSHOT));
@@ -3669,6 +3856,7 @@ mod tests {
     fn parse_mcp_config_accepts_tools_profiles() {
         let config = parse_mcp_config(&["--tools".into(), "core,network".into()]).unwrap();
         assert!(config.allows(TOOL_OPEN));
+        assert!(config.allows(TOOL_READ));
         assert!(config.allows(TOOL_NETWORK_REQUESTS));
         assert!(!config.allows(TOOL_REACT_TREE));
     }
@@ -3677,6 +3865,7 @@ mod tests {
     fn parse_mcp_config_accepts_all_profile() {
         let config = parse_mcp_config(&["--tools=all".into()]).unwrap();
         assert!(config.allows(TOOL_OPEN));
+        assert!(config.allows(TOOL_READ));
         assert!(config.allows(TOOL_NETWORK_HAR_START));
         assert!(config.allows(TOOL_REACT_TREE));
     }
@@ -3717,6 +3906,20 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("agent-browser mcp --tools all"));
+    }
+
+    #[test]
+    fn response_text_uses_read_content_before_url_metadata() {
+        let text = response_text(&json!({
+            "success": true,
+            "data": {
+                "url": "https://example.com/docs",
+                "content": "# Docs\n\nReadable content."
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(text, "# Docs\n\nReadable content.");
     }
 
     #[test]
@@ -3798,6 +4001,23 @@ mod tests {
     }
 
     #[test]
+    fn common_global_args_use_equals_form_for_string_restore_key() {
+        let mut args = Vec::new();
+
+        append_common_global_args(
+            &mut args,
+            &json!({
+                "session": "work",
+                "restore": "open"
+            }),
+            Some("work"),
+        )
+        .unwrap();
+
+        assert_eq!(args, vec!["--session", "work", "--restore=open"]);
+    }
+
+    #[test]
     fn tool_schema_includes_extra_args_for_cli_parity() {
         let tools = tools();
         let open = tools
@@ -3807,6 +4027,14 @@ mod tests {
         assert_eq!(
             open["inputSchema"]["properties"]["extraArgs"]["type"],
             "array"
+        );
+        assert_eq!(
+            open["inputSchema"]["properties"]["restoreSave"]["enum"][0],
+            "auto"
+        );
+        assert_eq!(
+            open["inputSchema"]["properties"]["namespace"]["type"],
+            "string"
         );
     }
 
@@ -3821,6 +4049,10 @@ mod tests {
             .iter()
             .find(|t| t["name"].as_str() == Some(TOOL_GET_URL))
             .unwrap();
+        let read = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some(TOOL_READ))
+            .unwrap();
         let skills_get = tools
             .iter()
             .find(|t| t["name"].as_str() == Some(TOOL_SKILLS_GET))
@@ -3828,6 +4060,8 @@ mod tests {
 
         assert_eq!(open["annotations"]["readOnlyHint"], false);
         assert_eq!(open["annotations"]["openWorldHint"], true);
+        assert_eq!(read["annotations"]["readOnlyHint"], true);
+        assert_eq!(read["annotations"]["openWorldHint"], true);
         assert_eq!(get_url["annotations"]["readOnlyHint"], true);
         assert_eq!(get_url["annotations"]["openWorldHint"], true);
         assert_eq!(skills_get["annotations"]["openWorldHint"], false);

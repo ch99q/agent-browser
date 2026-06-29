@@ -1,8 +1,57 @@
 # agent-browser
 
-## 0.29.1
+## 0.31.1
 
 <!-- release:start -->
+### Bug Fixes
+
+- Fixed the **React renderer** so it picks the react-dom renderer instead of hardcoding renderer id 1, which prevented reading an empty tree on Next.js 16.3 Turbopack (#1491)
+
+### Contributors
+
+- @gaojude
+<!-- release:end -->
+
+## 0.31.0
+
+### New Features
+
+- **Restore workflow** - Added `--restore`, `--restore-save`, restore validation flags, worktree-scoped `session id`, `session info`, and `--namespace` so agent runs can use stable, isolated, automatically restored browser state without managing state files by hand (#1486)
+
+### Improvements
+
+- Hardened **session lifecycle handling** with explicit daemon and browser compatibility checks, lifecycle status output, MCP support for restore options, and safer auto-save behavior that avoids overwriting good state after a failed restore or failed validation (#1486)
+
+### Bug Fixes
+
+- Fixed **restore lifecycle edge cases** around switching restore keys with a live browser, daemon configuration startup races, launch mode validation, and clearing restore failures after an explicit state load (#1486)
+
+### Contributors
+
+- @ctate
+
+## 0.30.1
+
+### Bug Fixes
+
+- Fixed **URL waits** so `wait --url` and `waitforurl` honor glob patterns such as `**/dashboard` against the full active URL (#1483)
+
+### Contributors
+
+- @gaearon
+
+## 0.30.0
+
+### New Features
+
+- **Read command** - Added `agent-browser read [url]` and the matching MCP tool for agent-readable text extraction. URL reads prefer Markdown, try `.md` and nearby `llms.txt` docs, support outlines, filters, raw and JSON output, headers, and domain/output safeguards; omitting the URL reads the rendered active tab DOM with current browser state (#1480)
+
+### Contributors
+
+- @ctate
+
+## 0.29.1
+
 ### Improvements
 
 - Defaulted **sandbox system dependency installs** so the Eve and Vercel sandbox helpers install Chromium's required libraries unless explicitly disabled, making first-run sandbox setup simpler (#1469)
@@ -10,7 +59,6 @@
 ### Contributors
 
 - @ctate
-<!-- release:end -->
 
 ## 0.29.0
 
