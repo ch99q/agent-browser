@@ -111,6 +111,7 @@ agent-browser find role button click --name "Submit"
 ```bash
 agent-browser open                    # Launch browser (no navigation); stays on about:blank
 agent-browser open <url>              # Launch + navigate to URL (aliases: goto, navigate)
+agent-browser read [url]              # Fetch agent-readable text, or read rendered active-tab DOM
 agent-browser click <sel>             # Click element (--new-tab to open in new tab)
 agent-browser dblclick <sel>          # Double-click element
 agent-browser focus <sel>             # Focus element
@@ -160,6 +161,23 @@ agent-browser get count <sel>         # Count matching elements
 agent-browser get box <sel>           # Get bounding box
 agent-browser get styles <sel>        # Get computed styles
 ```
+
+### Read Agent-Friendly Text
+
+```bash
+agent-browser read
+agent-browser read https://example.com/article
+agent-browser read https://example.com/article --filter overview
+agent-browser read https://example.com/article --outline
+agent-browser read https://docs.example.com --llms index --filter auth
+agent-browser read https://docs.example.com --llms full --filter auth
+agent-browser read example.com/article --require-md
+agent-browser read https://example.com/article --json
+```
+
+`read` fetches a URL without launching Chrome. Omit the URL to read the rendered DOM of the active tab in the current browser session, including browser auth state and client-side updates. Explicit URL reads send `Accept: text/markdown` by default, try the same URL with `.md` appended when the first response is not markdown, walk ancestor paths toward `/` to find the nearest `llms.txt` for a matching docs link, print markdown or plain text when available, and fall back to readable text extracted from HTML. `--llms` and `--require-md` with no URL use the active tab URL because they depend on HTTP resources. `read` does not read `llms-full.txt` unless you ask for it.
+
+Options: `--raw` prints the response body without HTML extraction, `--require-md` fails unless the server returns `Content-Type: text/markdown`, `--outline` prints a compact heading outline for one page, `--llms index` prints a compact nearest-ancestor `llms.txt` link list, `--llms full` reads the nearest-ancestor `llms-full.txt`, `--filter <text>` narrows page sections, llms links/sections, or outline headings, and `--timeout <ms>` changes the request timeout. Global safeguards such as `--allowed-domains`, `--content-boundaries`, and `--max-output` also apply to read fetches and output.
 
 ### Check State
 
@@ -555,7 +573,7 @@ agent-browser provides multiple ways to persist login sessions so you don't re-a
 |----------|----------|------------|
 | **Chrome profile reuse** | Reuse your existing Chrome login state (cookies, sessions) with zero setup | `--profile <name>` / `AGENT_BROWSER_PROFILE` |
 | **Persistent profile** | Full browser state (cookies, IndexedDB, service workers, cache) across restarts | `--profile <path>` / `AGENT_BROWSER_PROFILE` |
-| **Session persistence** | Auto-save/restore cookies + localStorage by name | `--session-name <name>` / `AGENT_BROWSER_SESSION_NAME` |
+| **Session persistence** | Auto-save/restore cookies + localStorage from a stable session key | `--session <id> --restore` / `AGENT_BROWSER_RESTORE` |
 | **Import from your browser** | Grab auth from a Chrome session you already logged into | `--auto-connect` + `state save` |
 | **State file** | Load a previously saved state JSON on launch | `--state <path>` / `AGENT_BROWSER_STATE` |
 | **Auth vault** | Store credentials locally (encrypted), login by name | `auth save` / `auth login` |
@@ -576,9 +594,10 @@ agent-browser --auto-connect state save ./my-auth.json
 # 3. Use the saved auth in future sessions
 agent-browser --state ./my-auth.json open https://app.example.com/dashboard
 
-# 4. Or use --session-name for automatic persistence
-agent-browser --session-name myapp state load ./my-auth.json
-# From now on, --session-name myapp auto-saves/restores this state
+# 4. Or use --restore for automatic persistence
+SESSION="$(agent-browser session id --scope worktree --prefix myapp)"
+agent-browser --session "$SESSION" --restore --state ./my-auth.json open https://app.example.com/dashboard
+# From now on, --session "$SESSION" --restore auto-saves/restores this state
 ```
 
 > **Security notes:**
@@ -608,6 +627,12 @@ agent-browser session list
 
 # Show current session
 agent-browser session
+
+# Generate a stable worktree-scoped session id
+agent-browser session id --scope worktree --prefix next-dev-loop
+
+# Inspect daemon, launch, and restore status
+agent-browser session info --json
 ```
 
 Each session has its own:
@@ -666,18 +691,18 @@ The profile directory stores:
 
 ## Session Persistence
 
-Alternatively, use `--session-name` to automatically save and restore cookies and localStorage across browser restarts:
+Use `--restore` with a stable `--session` to automatically save and restore cookies and localStorage across browser restarts:
 
 ```bash
-# Auto-save/load state for "twitter" session
-agent-browser --session-name twitter open twitter.com
+# Generate a stable id for this worktree and auto-save/load state
+SESSION="$(agent-browser session id --scope worktree --prefix twitter)"
+agent-browser --session "$SESSION" --restore open twitter.com
 
 # Login once, then state persists automatically
 # State files stored in ~/.agent-browser/sessions/
 
-# Or via environment variable
-export AGENT_BROWSER_SESSION_NAME=twitter
-agent-browser open twitter.com
+# Optional: validate restored state before auto-saving again
+agent-browser --session "$SESSION" --restore --restore-check-text Dashboard open twitter.com
 ```
 
 ### State Encryption
@@ -689,12 +714,15 @@ Encrypt saved session data at rest with AES-256-GCM:
 export AGENT_BROWSER_ENCRYPTION_KEY=<64-char-hex-key>
 
 # State files are now encrypted automatically
-agent-browser --session-name secure open example.com
+agent-browser --session secure --restore open example.com
 ```
 
 | Variable                          | Description                                        |
 | --------------------------------- | -------------------------------------------------- |
-| `AGENT_BROWSER_SESSION_NAME`      | Auto-save/load state persistence name              |
+| `AGENT_BROWSER_RESTORE`           | Auto-save/load state persistence name              |
+| `AGENT_BROWSER_RESTORE_SAVE`      | Restore save policy: `auto`, `always`, or `never`  |
+| `AGENT_BROWSER_NAMESPACE`         | Namespace for daemon sockets and restore state     |
+| `AGENT_BROWSER_SESSION_NAME`      | Legacy auto-save/load state persistence name       |
 | `AGENT_BROWSER_ENCRYPTION_KEY`    | 64-char hex key for AES-256-GCM encryption         |
 | `AGENT_BROWSER_STATE_EXPIRE_DAYS` | Auto-delete states older than N days (default: 30) |
 
@@ -859,7 +887,13 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | Option | Description |
 |--------|-------------|
 | `--session <name>` | Use isolated session (or `AGENT_BROWSER_SESSION` env) |
-| `--session-name <name>` | Auto-save/restore session state (or `AGENT_BROWSER_SESSION_NAME` env) |
+| `--restore [name]` | Auto-save/restore session state. Bare `--restore` uses `--session` as the key |
+| `--restore-save <policy>` | Restore save policy: `auto`, `always`, or `never` |
+| `--restore-check-url <glob>` | Validate restored state against a URL pattern |
+| `--restore-check-text <text>` | Validate restored state against page text |
+| `--restore-check-fn <js>` | Validate restored state against a truthy JavaScript expression |
+| `--namespace <name>` | Isolate daemon sockets and restore-state directories |
+| `--session-name <name>` | Legacy alias for restore persistence key |
 | `--profile <name\|path>` | Chrome profile name or persistent directory path (or `AGENT_BROWSER_PROFILE` env) |
 | `--state <path>` | Load storage state from JSON file (or `AGENT_BROWSER_STATE` env) |
 | `--headers <json>` | Set HTTP headers scoped to the URL's origin |
