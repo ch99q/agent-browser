@@ -9,14 +9,15 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::signal;
-use tokio::sync::{mpsc, Notify, RwLock};
+use tokio::sync::{Notify, RwLock};
 
 use super::actions::{
-    auto_save_restore_state, close_current_browser, execute_command, DaemonState,
+    auto_save_restore_state, close_all_browser_backends, close_current_browser, execute_command,
+    maybe_autosave_restore_state, DaemonState,
 };
 use super::cdp::client::CdpClient;
 use super::state;
-use super::stream::StreamServer;
+use super::stream::{IdleActivity, StreamServer};
 use crate::connection::INTERNAL_DAEMON_SHUTDOWN_ACTION;
 
 pub async fn run_daemon(session: &str) {
@@ -98,11 +99,19 @@ pub async fn run_daemon(session: &str) {
 
     let mut stream_client: Option<Arc<RwLock<Option<Arc<CdpClient>>>>> = None;
     let mut stream_server_instance: Option<Arc<StreamServer>> = None;
+    let idle_activity = Arc::new(IdleActivity::new());
     let preferred_port = env::var("AGENT_BROWSER_STREAM_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
-    match StreamServer::start_without_client(preferred_port, session.to_string(), true).await {
+    match StreamServer::start_without_client(
+        preferred_port,
+        session.to_string(),
+        true,
+        idle_activity.clone(),
+    )
+    .await
+    {
         Ok((stream_server, client_slot)) => {
             stream_client = Some(client_slot.clone());
             if let Err(e) = fs::write(&stream_path, stream_server.port().to_string()) {
@@ -115,19 +124,22 @@ pub async fn run_daemon(session: &str) {
         }
     }
 
-    // Auto-shutdown the daemon after this many ms of inactivity (no commands received).
-    // Disabled when unset or 0.
-    let idle_timeout_ms = env::var("AGENT_BROWSER_IDLE_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&ms| ms > 0);
+    // Auto-shutdown the daemon after this many ms of inactivity (no commands
+    // or dashboard input received). Applies a default when
+    // AGENT_BROWSER_IDLE_TIMEOUT_MS is unset; an explicit 0 disables idle
+    // shutdown entirely.
+    let idle_timeout = resolve_idle_timeout(env::var("AGENT_BROWSER_IDLE_TIMEOUT_MS").ok());
+
+    let autosave_interval_ms = autosave_interval_ms_from_env();
 
     let result = run_socket_server(
         &socket_path,
         session,
         stream_client,
         stream_server_instance,
-        idle_timeout_ms,
+        idle_activity,
+        idle_timeout,
+        autosave_interval_ms,
     )
     .await;
 
@@ -152,15 +164,71 @@ pub async fn run_daemon(session: &str) {
     }
 }
 
+/// Idle timeout applied when AGENT_BROWSER_IDLE_TIMEOUT_MS is unset, so an
+/// integration that dies without calling `close` cannot leak the daemon and
+/// its Chrome tree indefinitely (issue: leaked daemons observed running for
+/// days). Socket commands and dashboard input reset the timer. Unlike an
+/// explicit timeout, the default never closes a headed browser (including
+/// Safari and iOS WebDriver sessions) or a user-attached browser because those
+/// may be in direct human use that the daemon cannot observe. Provider-owned
+/// CDP browsers remain eligible for cleanup.
+pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 60 * 60 * 1000;
+
+#[derive(Clone, Copy)]
+struct IdleTimeout {
+    ms: u64,
+    /// True when the value came from DEFAULT_IDLE_TIMEOUT_MS rather than an
+    /// explicit AGENT_BROWSER_IDLE_TIMEOUT_MS. Only the default exempts
+    /// headed and user-attached browsers from shutdown.
+    is_default: bool,
+}
+
+/// Resolve AGENT_BROWSER_IDLE_TIMEOUT_MS into an effective idle timeout:
+/// unset or unparseable → the default; explicit 0 → disabled (None);
+/// any other value → that many milliseconds.
+fn resolve_idle_timeout(raw: Option<String>) -> Option<IdleTimeout> {
+    match raw.as_deref().map(str::trim).map(str::parse::<u64>) {
+        Some(Ok(0)) => None,
+        Some(Ok(ms)) => Some(IdleTimeout {
+            ms,
+            is_default: false,
+        }),
+        // Unparseable values are validated (with a warning) at the flags
+        // layer; falling back to the default here keeps the leak backstop
+        // in place rather than silently disabling it.
+        Some(Err(_)) | None => Some(IdleTimeout {
+            ms: DEFAULT_IDLE_TIMEOUT_MS,
+            is_default: true,
+        }),
+    }
+}
+
+fn remaining_idle_timeout(activity: &IdleActivity, timeout_ms: u64) -> Option<Duration> {
+    Duration::from_millis(timeout_ms).checked_sub(activity.elapsed())
+}
+
+/// Minimum ms between periodic session autosaves while the browser is open.
+/// Defaults to 30s; 0 disables periodic autosave (save-on-close still runs).
+fn autosave_interval_ms_from_env() -> u64 {
+    env::var("AGENT_BROWSER_AUTOSAVE_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30_000)
+}
+
 #[cfg(unix)]
 async fn run_socket_server(
     socket_path: &PathBuf,
     session: &str,
     stream_client: Option<Arc<RwLock<Option<Arc<CdpClient>>>>>,
     stream_server: Option<Arc<StreamServer>>,
-    idle_timeout_ms: Option<u64>,
+    idle_activity: Arc<IdleActivity>,
+    idle_timeout: Option<IdleTimeout>,
+    autosave_interval_ms: u64,
 ) -> Result<(), String> {
     use tokio::net::UnixListener;
+
+    let idle_timeout_ms = idle_timeout.map(|t| t.ms);
 
     let listener =
         UnixListener::bind(socket_path).map_err(|e| format!("Failed to bind socket: {}", e))?;
@@ -171,13 +239,12 @@ async fn run_socket_server(
     } else {
         None
     };
-
-    let state: std::sync::Arc<tokio::sync::Mutex<DaemonState>> = std::sync::Arc::new(
-        tokio::sync::Mutex::new(DaemonState::new_with_stream(stream_client, stream_server)),
-    );
-
-    let (reset_tx, mut reset_rx) = mpsc::channel::<()>(64);
-    let reset_tx = idle_timeout_ms.map(|_| Arc::new(reset_tx));
+    let state: std::sync::Arc<tokio::sync::Mutex<DaemonState>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(DaemonState::new_with_stream(
+            stream_client,
+            stream_server,
+            idle_activity.clone(),
+        )));
 
     // Notifier used by handle_connection to signal the daemon loop to exit
     // after a "close" command, instead of calling process::exit() which skips
@@ -189,6 +256,7 @@ async fn run_socket_server(
 
     let idle_sleep = idle_timeout_ms.map(|ms| tokio::time::sleep(Duration::from_millis(ms)));
     let mut idle_sleep_pin = idle_sleep.map(Box::pin);
+    let mut idle_lock: Option<IdleLock> = None;
 
     loop {
         tokio::select! {
@@ -196,11 +264,11 @@ async fn run_socket_server(
                 match accept_result {
                     Ok((stream, _)) => {
                         let state = state.clone();
-                        let reset_tx = reset_tx.clone();
+                        let idle_activity = idle_activity.clone();
                         let sf = stream_file.clone();
                         let cn = close_notify.clone();
                         tokio::spawn(async move {
-                            handle_connection(stream, state, reset_tx, sf, cn).await;
+                            handle_connection(stream, state, idle_activity, sf, cn).await;
                         });
                     }
                     Err(e) => {
@@ -209,30 +277,52 @@ async fn run_socket_server(
                 }
             }
             _ = drain_interval.tick() => {
-                let mut s = state.lock().await;
-                let process_exited = s
-                    .browser
-                    .as_mut()
-                    .map(|mgr| mgr.has_process_exited())
-                    .unwrap_or(false);
-                if process_exited {
-                    let _ = close_current_browser(&mut s).await;
-                } else if s.browser.is_some() {
-                    s.drain_cdp_events_background().await;
-                }
+                spawn_background_tick_if_idle(state.clone(), autosave_interval_ms);
             }
             _ = async {
                 match idle_sleep_pin {
                     Some(ref mut s) => s.as_mut().await,
                     None => std::future::pending::<()>().await,
                 }
-            }, if idle_timeout_ms.is_some() => {
-                let mut s = state.lock().await;
+            }, if idle_timeout_ms.is_some() && idle_lock.is_none() => {
+                // Wait for the state lock in its own branch so a command
+                // holding it does not stop the loop accepting connections.
+                idle_lock = Some(Box::pin(state.clone().lock_owned()));
+            }
+            s = async { idle_lock.as_mut().expect("idle lock armed").await }, if idle_lock.is_some() => {
+                idle_lock = None;
+                let mut s = s;
+                // The timer may have expired while a command held the state
+                // lock. Command completion refreshes the shared activity
+                // clock before releasing that lock, so re-check it here.
+                if let Some(remaining) =
+                    remaining_idle_timeout(&idle_activity, idle_timeout_ms.unwrap_or_default())
+                {
+                    idle_sleep_pin = Some(Box::pin(tokio::time::sleep(remaining)));
+                    continue;
+                }
+                // The default timeout is a leak backstop, not a lifecycle
+                // policy: never pull a headed, WebDriver, or attached browser
+                // out from under a human. Re-arm and keep waiting instead.
+                if idle_timeout.is_some_and(|t| t.is_default)
+                    && s.blocks_default_idle_shutdown()
+                {
+                    idle_sleep_pin = idle_timeout_ms
+                        .map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
+                    continue;
+                }
+                if idle_timeout.is_some_and(|t| t.is_default) {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "Idle for {}m with no commands or dashboard input; saving configured restore state and shutting down (AGENT_BROWSER_IDLE_TIMEOUT_MS=0 disables)",
+                        DEFAULT_IDLE_TIMEOUT_MS / 60_000
+                    );
+                }
                 let _ = auto_save_restore_state(&mut s).await;
-                let _ = close_current_browser(&mut s).await;
+                let _ = close_all_browser_backends(&mut s).await;
                 break;
             }
-            _ = reset_rx.recv(), if idle_timeout_ms.is_some() => {
+            _ = idle_activity.notified(), if idle_timeout_ms.is_some() => {
                 idle_sleep_pin = idle_timeout_ms
                     .map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
                 continue;
@@ -244,9 +334,14 @@ async fn run_socket_server(
                 break;
             }
             _ = shutdown_signal() => {
-                let mut s = state.lock().await;
+                // An armed idle lock already holds a place in the lock queue;
+                // await it rather than queueing behind it.
+                let mut s = match idle_lock.take() {
+                    Some(idle_lock) => idle_lock.await,
+                    None => state.clone().lock_owned().await,
+                };
                 let _ = auto_save_restore_state(&mut s).await;
-                let _ = close_current_browser(&mut s).await;
+                let _ = close_all_browser_backends(&mut s).await;
                 break;
             }
         }
@@ -261,9 +356,13 @@ async fn run_socket_server(
     session: &str,
     stream_client: Option<Arc<RwLock<Option<Arc<CdpClient>>>>>,
     stream_server: Option<Arc<StreamServer>>,
-    idle_timeout_ms: Option<u64>,
+    idle_activity: Arc<IdleActivity>,
+    idle_timeout: Option<IdleTimeout>,
+    autosave_interval_ms: u64,
 ) -> Result<(), String> {
     use tokio::net::TcpListener;
+
+    let idle_timeout_ms = idle_timeout.map(|t| t.ms);
 
     let preferred_port = get_port_for_session(session);
     // Try the hash-derived port first; if it is blocked (e.g. Windows Hyper-V
@@ -288,18 +387,24 @@ async fn run_socket_server(
     } else {
         None
     };
-
-    let state: std::sync::Arc<tokio::sync::Mutex<DaemonState>> = std::sync::Arc::new(
-        tokio::sync::Mutex::new(DaemonState::new_with_stream(stream_client, stream_server)),
-    );
-
-    let (reset_tx, mut reset_rx) = mpsc::channel::<()>(64);
-    let reset_tx = idle_timeout_ms.map(|_| Arc::new(reset_tx));
+    let state: std::sync::Arc<tokio::sync::Mutex<DaemonState>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(DaemonState::new_with_stream(
+            stream_client,
+            stream_server,
+            idle_activity.clone(),
+        )));
 
     let close_notify = Arc::new(Notify::new());
 
     let idle_sleep = idle_timeout_ms.map(|ms| tokio::time::sleep(Duration::from_millis(ms)));
     let mut idle_sleep_pin = idle_sleep.map(Box::pin);
+    let mut idle_lock: Option<IdleLock> = None;
+
+    // Mirror the unix loop's background tick: reap a browser the user closed
+    // by hand, and drain CDP events (dialog state in particular) before
+    // autosave so a save never runs against a dialog-blocked renderer.
+    let mut drain_interval = tokio::time::interval(Duration::from_millis(100));
+    drain_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -307,11 +412,11 @@ async fn run_socket_server(
                 match accept_result {
                     Ok((stream, _)) => {
                         let state = state.clone();
-                        let reset_tx = reset_tx.clone();
+                        let idle_activity = idle_activity.clone();
                         let sf = stream_file.clone();
                         let cn = close_notify.clone();
                         tokio::spawn(async move {
-                            handle_connection(stream, state, reset_tx, sf, cn).await;
+                            handle_connection(stream, state, idle_activity, sf, cn).await;
                         });
                     }
                     Err(e) => {
@@ -319,19 +424,51 @@ async fn run_socket_server(
                     }
                 }
             }
+            _ = drain_interval.tick() => {
+                spawn_background_tick_if_idle(state.clone(), autosave_interval_ms);
+            }
             _ = async {
                 match idle_sleep_pin {
                     Some(ref mut s) => s.as_mut().await,
                     None => std::future::pending::<()>().await,
                 }
-            }, if idle_timeout_ms.is_some() => {
-                let mut s = state.lock().await;
+            }, if idle_timeout_ms.is_some() && idle_lock.is_none() => {
+                // Wait for the state lock in its own branch so a command
+                // holding it does not stop the loop accepting connections.
+                idle_lock = Some(Box::pin(state.clone().lock_owned()));
+            }
+            s = async { idle_lock.as_mut().expect("idle lock armed").await }, if idle_lock.is_some() => {
+                idle_lock = None;
+                let mut s = s;
+                if let Some(remaining) =
+                    remaining_idle_timeout(&idle_activity, idle_timeout_ms.unwrap_or_default())
+                {
+                    idle_sleep_pin = Some(Box::pin(tokio::time::sleep(remaining)));
+                    continue;
+                }
+                // The default timeout is a leak backstop, not a lifecycle
+                // policy: never pull a headed, WebDriver, or attached browser
+                // out from under a human. Re-arm and keep waiting instead.
+                if idle_timeout.is_some_and(|t| t.is_default)
+                    && s.blocks_default_idle_shutdown()
+                {
+                    idle_sleep_pin = idle_timeout_ms
+                        .map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
+                    continue;
+                }
+                if idle_timeout.is_some_and(|t| t.is_default) {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "Idle for {}m with no commands or dashboard input; saving configured restore state and shutting down (AGENT_BROWSER_IDLE_TIMEOUT_MS=0 disables)",
+                        DEFAULT_IDLE_TIMEOUT_MS / 60_000
+                    );
+                }
                 let _ = auto_save_restore_state(&mut s).await;
-                let _ = close_current_browser(&mut s).await;
+                let _ = close_all_browser_backends(&mut s).await;
                 let _ = fs::remove_file(&port_path);
                 break;
             }
-            _ = reset_rx.recv(), if idle_timeout_ms.is_some() => {
+            _ = idle_activity.notified(), if idle_timeout_ms.is_some() => {
                 idle_sleep_pin = idle_timeout_ms
                     .map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
                 continue;
@@ -341,9 +478,14 @@ async fn run_socket_server(
                 break;
             }
             _ = shutdown_signal() => {
-                let mut s = state.lock().await;
+                // An armed idle lock already holds a place in the lock queue;
+                // await it rather than queueing behind it.
+                let mut s = match idle_lock.take() {
+                    Some(idle_lock) => idle_lock.await,
+                    None => state.clone().lock_owned().await,
+                };
                 let _ = auto_save_restore_state(&mut s).await;
-                let _ = close_current_browser(&mut s).await;
+                let _ = close_all_browser_backends(&mut s).await;
                 let _ = fs::remove_file(&port_path);
                 break;
             }
@@ -353,10 +495,47 @@ async fn run_socket_server(
     Ok(())
 }
 
+type IdleLock = std::pin::Pin<
+    Box<dyn std::future::Future<Output = tokio::sync::OwnedMutexGuard<DaemonState>> + Send>,
+>;
+
+/// Run the periodic browser maintenance tick in the background, skipping it
+/// when a command holds the state lock. A skipped tick loses nothing: CDP
+/// events stay buffered and autosave is rechecked on the next tick.
+fn spawn_background_tick_if_idle(
+    state: Arc<tokio::sync::Mutex<DaemonState>>,
+    autosave_interval_ms: u64,
+) -> bool {
+    let Ok(mut state) = state.try_lock_owned() else {
+        return false;
+    };
+    tokio::spawn(async move {
+        let process_exited = state
+            .browser
+            .as_mut()
+            .map(|mgr| mgr.has_process_exited())
+            .unwrap_or(false);
+        if process_exited {
+            let _ = close_current_browser(&mut state).await;
+        } else if state.browser.is_some() {
+            if let Err(error) = state.drain_cdp_events_background().await {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Failed to apply browser network controls: {}",
+                    error
+                );
+            } else {
+                maybe_autosave_restore_state(&mut state, autosave_interval_ms).await;
+            }
+        }
+    });
+    true
+}
+
 async fn handle_connection<S>(
     stream: S,
     state: std::sync::Arc<tokio::sync::Mutex<DaemonState>>,
-    idle_reset_tx: Option<Arc<mpsc::Sender<()>>>,
+    idle_activity: Arc<IdleActivity>,
     stream_file_cleanup: Option<PathBuf>,
     close_notify: Arc<Notify>,
 ) where
@@ -394,9 +573,7 @@ async fn handle_connection<S>(
                     }
                 };
 
-                if let Some(ref tx) = idle_reset_tx {
-                    let _ = tx.try_send(());
-                }
+                idle_activity.mark();
 
                 let action = cmd
                     .get("action")
@@ -406,7 +583,12 @@ async fn handle_connection<S>(
 
                 let response = {
                     let mut s = state.lock().await;
-                    execute_command(&cmd, &mut s).await
+                    let response = execute_command(&cmd, &mut s).await;
+                    // Refresh while the state lock is still held. An idle
+                    // timer waiting on this command will observe the updated
+                    // clock as soon as it acquires the lock.
+                    idle_activity.mark();
+                    response
                 };
 
                 let mut resp = serde_json::to_string(&response).unwrap_or_default();
@@ -528,6 +710,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_resolve_idle_timeout_unset_applies_default() {
+        let t = resolve_idle_timeout(None).expect("default should apply when unset");
+        assert_eq!(t.ms, DEFAULT_IDLE_TIMEOUT_MS);
+        assert!(t.is_default);
+    }
+
+    #[test]
+    fn test_resolve_idle_timeout_explicit_zero_disables() {
+        assert!(resolve_idle_timeout(Some("0".to_string())).is_none());
+        assert!(resolve_idle_timeout(Some(" 0 ".to_string())).is_none());
+    }
+
+    #[test]
+    fn test_resolve_idle_timeout_explicit_value_is_not_default() {
+        let t = resolve_idle_timeout(Some("5000".to_string())).expect("explicit value");
+        assert_eq!(t.ms, 5000);
+        assert!(!t.is_default);
+    }
+
+    #[test]
+    fn test_resolve_idle_timeout_unparseable_falls_back_to_default() {
+        for raw in ["banana", "", "-1", "30s"] {
+            let t = resolve_idle_timeout(Some(raw.to_string()))
+                .unwrap_or_else(|| panic!("{:?} should fall back to default", raw));
+            assert_eq!(t.ms, DEFAULT_IDLE_TIMEOUT_MS);
+            assert!(t.is_default);
+        }
+    }
+
+    #[test]
+    fn test_default_idle_timeout_does_not_close_webdriver_sessions() {
+        let mut state = DaemonState::new();
+        assert!(!state.blocks_default_idle_shutdown());
+
+        state.backend_type = crate::native::actions::BackendType::WebDriver;
+        assert!(state.blocks_default_idle_shutdown());
+    }
+
+    #[tokio::test]
+    async fn test_idle_activity_receives_dashboard_activity() {
+        let activity = Arc::new(IdleActivity::new());
+        activity.mark();
+
+        tokio::time::timeout(Duration::from_millis(100), activity.notified())
+            .await
+            .expect("dashboard input notification should wake the idle loop");
+    }
+
+    #[tokio::test]
+    async fn test_command_completion_rearms_expired_idle_timeout() {
+        let activity = IdleActivity::new();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            remaining_idle_timeout(&activity, 1).is_none(),
+            "the original idle deadline should have expired"
+        );
+
+        // A command that held the daemon state lock past the deadline marks
+        // completion before releasing the lock. The timeout path must then
+        // wait for a new full idle period instead of closing immediately.
+        activity.mark();
+        assert!(remaining_idle_timeout(&activity, 100).is_some());
+    }
+
+    #[test]
     fn test_daemon_socket_dir_matches_client_namespace() {
         let guard = crate::test_utils::EnvGuard::new(&[
             "AGENT_BROWSER_SOCKET_DIR",
@@ -601,6 +848,24 @@ mod tests {
         assert!(close_completed_response("confirm", &confirmed));
     }
 
+    #[tokio::test]
+    async fn test_background_tick_skips_busy_state() {
+        let state = Arc::new(tokio::sync::Mutex::new(DaemonState::new()));
+        let held = state.lock().await;
+
+        for _ in 0..100 {
+            assert!(!spawn_background_tick_if_idle(state.clone(), 30_000));
+        }
+        // Skipped ticks must not leave tasks queued on the lock.
+        assert_eq!(Arc::strong_count(&state), 1);
+
+        drop(held);
+        assert!(spawn_background_tick_if_idle(state.clone(), 30_000));
+        let _ = tokio::time::timeout(Duration::from_secs(1), state.lock())
+            .await
+            .expect("background tick should release the state lock");
+    }
+
     /// Guard against re-introducing `waitpid(-1)` in daemon code.
     ///
     /// Issue #1035: a SIGCHLD handler that called `waitpid(-1, WNOHANG)` was
@@ -643,18 +908,21 @@ mod tests {
             .spawn()
             .expect("failed to spawn child");
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                assert!(
-                    !status.success(),
-                    "child exited with code 42, should not be success"
-                );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("child did not exit before the deadline");
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(e) => panic!("try_wait() should succeed without waitpid(-1): {}", e),
             }
-            Ok(None) => panic!("try_wait() returned None but child should have exited"),
-            Err(e) => panic!("try_wait() should succeed without waitpid(-1): {}", e),
-        }
+        };
+
+        assert_eq!(status.code(), Some(42));
     }
 
     /// Regression test for #1101: idle timeout must fire even while the
@@ -664,13 +932,11 @@ mod tests {
     /// could never reach its deadline.
     #[tokio::test]
     async fn test_idle_timeout_fires_despite_drain_interval() {
-        use tokio::sync::mpsc;
-
         let idle_timeout_ms: u64 = 1000;
         let mut drain_interval = tokio::time::interval(Duration::from_millis(500));
         drain_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let (_reset_tx, mut reset_rx) = mpsc::channel::<()>(64);
+        let activity = IdleActivity::new();
 
         let start = tokio::time::Instant::now();
 
@@ -690,7 +956,7 @@ mod tests {
                     } => {
                         break;
                     }
-                    _ = reset_rx.recv() => {
+                    _ = activity.notified() => {
                         idle_sleep_pin = Some(Box::pin(
                             tokio::time::sleep(Duration::from_millis(idle_timeout_ms)),
                         ));

@@ -35,6 +35,10 @@ pub struct Response {
     pub success: bool,
     pub data: Option<Value>,
     pub error: Option<String>,
+    /// Machine-readable error code for select failures (e.g. `tab_gone`
+    /// when a pinned session's bound tab no longer exists).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
@@ -286,6 +290,7 @@ pub fn walk_daemons() -> DaemonInventory {
                     inventory.dashboard = Some(DashboardInfo { pid, alive });
                     if !alive {
                         let _ = fs::remove_file(entry.path());
+                        let _ = fs::remove_file(socket_dir.join("dashboard.config"));
                         inventory.cleaned.push(CleanedSession {
                             name: "dashboard".to_string(),
                             reason: CleanReason::DashboardGone,
@@ -442,6 +447,7 @@ pub struct DaemonOptions<'a> {
     pub ignore_https_errors: bool,
     pub allow_file_access: bool,
     pub hide_scrollbars: bool,
+    pub webgpu: bool,
     pub profile: Option<&'a str>,
     pub state: Option<&'a str>,
     pub provider: Option<&'a str>,
@@ -457,6 +463,7 @@ pub struct DaemonOptions<'a> {
     pub confirm_actions: Option<&'a str>,
     pub engine: Option<&'a str>,
     pub auto_connect: bool,
+    pub pin_tab: bool,
     pub idle_timeout: Option<&'a str>,
     pub default_timeout: Option<u64>,
     pub cdp: Option<&'a str>,
@@ -514,6 +521,9 @@ fn apply_daemon_env(cmd: &mut Command, session: &str, opts: &DaemonOptions) {
         "AGENT_BROWSER_HIDE_SCROLLBARS",
         if opts.hide_scrollbars { "1" } else { "0" },
     );
+    if opts.webgpu {
+        cmd.env("AGENT_BROWSER_WEBGPU", "1");
+    }
     if let Some(prof) = opts.profile {
         cmd.env("AGENT_BROWSER_PROFILE", prof);
     }
@@ -559,6 +569,9 @@ fn apply_daemon_env(cmd: &mut Command, session: &str, opts: &DaemonOptions) {
     if opts.auto_connect {
         cmd.env("AGENT_BROWSER_AUTO_CONNECT", "1");
     }
+    if opts.pin_tab {
+        cmd.env("AGENT_BROWSER_PIN_TAB", "1");
+    }
     if let Some(idle) = opts.idle_timeout {
         cmd.env("AGENT_BROWSER_IDLE_TIMEOUT_MS", idle);
     }
@@ -581,7 +594,6 @@ fn daemon_config_fingerprint(opts: &DaemonOptions) -> String {
     opts.debug.hash(&mut hasher);
     opts.action_policy.hash(&mut hasher);
     opts.confirm_actions.hash(&mut hasher);
-    opts.allowed_domains.hash(&mut hasher);
     opts.idle_timeout.hash(&mut hasher);
     opts.default_timeout.hash(&mut hasher);
     opts.no_auto_dialog.hash(&mut hasher);
@@ -1083,8 +1095,11 @@ fn has_os_error(error: &str, code: u32) -> bool {
 /// instead of 30s. Only commands that actually carry a `timeout` field get
 /// the extended budget, and that field is set client-side per invocation,
 /// avoiding the daemon's spawn-time env snapshot drifting from the client.
-fn read_timeout_for(cmd: &Value) -> Duration {
-    let op_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(0);
+pub(crate) fn read_timeout_for(cmd: &Value) -> Duration {
+    let mut op_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(0);
+    if cmd.get("action").and_then(Value::as_str) == Some("mousemove") {
+        op_ms = op_ms.max(cmd.get("duration").and_then(Value::as_u64).unwrap_or(0));
+    }
     Duration::from_millis(op_ms.saturating_add(10_000).max(30_000))
 }
 
@@ -1114,6 +1129,14 @@ fn send_command_once(cmd: &Value, session: &str) -> Result<Response, String> {
 mod tests {
     use super::*;
     use crate::test_utils::EnvGuard;
+
+    #[test]
+    fn long_mouse_movement_gets_its_requested_time_budget() {
+        assert_eq!(
+            read_timeout_for(&json!({"action":"mousemove", "duration": 35_000})),
+            Duration::from_secs(45)
+        );
+    }
 
     #[test]
     fn test_get_socket_dir_explicit_override() {
@@ -1247,6 +1270,7 @@ mod tests {
             ignore_https_errors: false,
             allow_file_access: false,
             hide_scrollbars: true,
+            webgpu: false,
             profile: None,
             state: None,
             provider: None,
@@ -1262,6 +1286,7 @@ mod tests {
             confirm_actions: None,
             engine: None,
             auto_connect: false,
+            pin_tab: false,
             idle_timeout,
             default_timeout: None,
             cdp: None,
@@ -1286,9 +1311,10 @@ mod tests {
             daemon_config_fingerprint(&base),
             daemon_config_fingerprint(&dialog_changed)
         );
-        assert_ne!(
+        assert_eq!(
             daemon_config_fingerprint(&base),
-            daemon_config_fingerprint(&domains_changed)
+            daemon_config_fingerprint(&domains_changed),
+            "allowed domains are browser launch state, not daemon identity"
         );
     }
 

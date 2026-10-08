@@ -36,8 +36,10 @@ export const navigation: NavSection[] = [
       { name: "Diffing", href: "/diffing" },
       { name: "Network", href: "/network" },
       { name: "CDP Mode", href: "/cdp-mode" },
+      { name: "WebMCP", href: "/webmcp" },
       { name: "Streaming", href: "/streaming" },
       { name: "Video Recording", href: "/recording" },
+      { name: "WebGPU", href: "/webgpu" },
       { name: "Debugging", href: "/debugging" },
       { name: "Profiler", href: "/profiler" },
       { name: "React & Web Vitals", href: "/react" },
@@ -47,6 +49,7 @@ export const navigation: NavSection[] = [
       { name: "iOS Simulator", href: "/ios" },
       { name: "Security", href: "/security" },
       { name: "Next.js + Vercel", href: "/next" },
+      { name: "eve Extension", href: "/eve" },
       { name: "Native Mode", href: "/native-mode" },
     ],
   },
@@ -58,6 +61,10 @@ export const navigation: NavSection[] = [
       { name: "Browserbase", href: "/providers/browserbase" },
       { name: "Browserless", href: "/providers/browserless" },
       { name: "Kernel", href: "/providers/kernel" },
+      {
+        name: "Remote Agent Browser",
+        href: "/providers/remote-agent-browser",
+      },
     ],
   },
   {
@@ -65,6 +72,7 @@ export const navigation: NavSection[] = [
     items: [
       { name: "Chrome", href: "/engines/chrome" },
       { name: "Lightpanda", href: "/engines/lightpanda" },
+      { name: "Obscura", href: "/engines/obscura" },
     ],
   },
   {
@@ -74,5 +82,5 @@ export const navigation: NavSection[] = [
 ];
 
 export const allDocsPages: NavItem[] = navigation.flatMap(
-  (section) => section.items
+  (section) => section.items,
 );

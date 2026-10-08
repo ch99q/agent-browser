@@ -21,6 +21,7 @@ jobs:
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
       should_publish_sandbox: ${{ steps.check.outputs.should_publish_sandbox }}
+      should_publish_eve: ${{ steps.check.outputs.should_publish_eve }}
       needs_github_release: ${{ steps.check.outputs.needs_github_release }}
       version: ${{ steps.check.outputs.version }}
     steps:
@@ -37,13 +38,17 @@ jobs:
         run: |
           LOCAL_VERSION=$(node -p "require('./package.json').version")
           SANDBOX_VERSION=$(node -p "require('./packages/@agent-browser/sandbox/package.json').version")
+          EVE_VERSION=$(node -p "require('./packages/@agent-browser/eve/package.json').version")
           echo "Local version: $LOCAL_VERSION"
           echo "Sandbox package version: $SANDBOX_VERSION"
+          echo "Eve package version: $EVE_VERSION"
 
           NPM_VERSION=$(npm view agent-browser version 2>/dev/null || echo "0.0.0")
           SANDBOX_NPM_VERSION=$(npm view @agent-browser/sandbox version 2>/dev/null || echo "0.0.0")
+          EVE_NPM_VERSION=$(npm view @agent-browser/eve version 2>/dev/null || echo "0.0.0")
           echo "npm version: $NPM_VERSION"
           echo "@agent-browser/sandbox npm version: $SANDBOX_NPM_VERSION"
+          echo "@agent-browser/eve npm version: $EVE_NPM_VERSION"
 
           if [ "$LOCAL_VERSION" != "$NPM_VERSION" ]; then
             echo "Version changed: $NPM_VERSION -> $LOCAL_VERSION"
@@ -70,6 +75,13 @@ jobs:
           else
             echo "Sandbox package version unchanged on npm, skipping publish"
             echo "should_publish_sandbox=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$EVE_VERSION" != "$EVE_NPM_VERSION" ]; then
+            echo "Eve package version changed: $EVE_NPM_VERSION -> $EVE_VERSION"
+            echo "should_publish_eve=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Eve package version unchanged on npm, skipping publish"
+            echo "should_publish_eve=false" >> "$GITHUB_OUTPUT"
           fi
           echo "version=$LOCAL_VERSION" >> "$GITHUB_OUTPUT"
         env:
@@ -164,7 +176,7 @@ jobs:
         if: matrix.use_zigbuild
         run: |
           pip3 install ziglang
-          cargo install cargo-zigbuild --version 0.22.3 --locked
+          cargo install cargo-zigbuild --version 0.23.2 --locked
 
       - name: Configure Rust linkers
         if: runner.os == 'Linux'
@@ -218,12 +230,23 @@ jobs:
           path: artifacts/${{ matrix.binary }}
           retention-days: 7
 
-  publish:
-    name: Publish to npm
+  publish-packages:
+    name: Publish packages to npm
     needs: [check-release, build-binaries]
-    if: needs.check-release.outputs.should_release == 'true'
+    if: >-
+      always() &&
+      needs.check-release.result == 'success' &&
+      (
+        needs.check-release.outputs.should_release == 'true' ||
+        needs.check-release.outputs.should_publish_sandbox == 'true' ||
+        needs.check-release.outputs.should_publish_eve == 'true'
+      ) &&
+      (
+        needs.check-release.outputs.should_release != 'true' ||
+        needs.build-binaries.result == 'success'
+      )
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     environment: Release
     permissions:
       contents: read
@@ -245,12 +268,17 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Sync version
+        run: pnpm run version:sync
+
       - name: Download all binary artifacts
+        if: needs.check-release.outputs.should_release == 'true'
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
 
       - name: Move binaries to bin directory
+        if: needs.check-release.outputs.should_release == 'true'
         run: |
           mkdir -p bin
           find artifacts -type f -name 'agent-browser-*' -exec mv {} bin/ \;
@@ -260,6 +288,7 @@ jobs:
           ls -la bin/
 
       - name: Verify all binaries exist
+        if: needs.check-release.outputs.should_release == 'true'
         run: |
           EXPECTED_BINARIES=(
             "agent-browser-linux-x64"
@@ -292,58 +321,55 @@ jobs:
           fi
           echo "All 7 platform binaries present and valid"
 
-      - name: Publish to npm
-        run: pnpm publish --provenance --no-git-checks
+      - name: Publish agent-browser
+        if: needs.check-release.outputs.should_release == 'true'
+        env:
+          PACKAGE_NAME: agent-browser
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          if pnpm view "${PACKAGE_NAME}@${VERSION}" version >/dev/null 2>&1; then
+            echo "${PACKAGE_NAME}@${VERSION} is already published; skipping"
+          else
+            pnpm publish --provenance --no-git-checks
+          fi
 
-  publish-sandbox:
-    name: Publish sandbox package to npm
-    needs: [check-release, publish]
-    if: >-
-      always() &&
-      needs.check-release.outputs.should_publish_sandbox == 'true' &&
-      (
-        needs.check-release.outputs.should_release != 'true' ||
-        needs.publish.result == 'success'
-      )
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    environment: Release
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Sync version
-        run: pnpm run version:sync
-
-      - name: Publish sandbox package to npm
+      - name: Publish @agent-browser/sandbox
+        if: needs.check-release.outputs.should_publish_sandbox == 'true'
         working-directory: packages/@agent-browser/sandbox
-        run: pnpm publish --provenance --access public --no-git-checks
+        env:
+          PACKAGE_NAME: '@agent-browser/sandbox'
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          if pnpm view "${PACKAGE_NAME}@${VERSION}" version >/dev/null 2>&1; then
+            echo "${PACKAGE_NAME}@${VERSION} is already published; skipping"
+          else
+            pnpm publish --provenance --access public --no-git-checks
+          fi
+
+      - name: Publish @agent-browser/eve
+        if: needs.check-release.outputs.should_publish_eve == 'true'
+        working-directory: packages/@agent-browser/eve
+        env:
+          PACKAGE_NAME: '@agent-browser/eve'
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          if pnpm view "${PACKAGE_NAME}@${VERSION}" version >/dev/null 2>&1; then
+            echo "${PACKAGE_NAME}@${VERSION} is already published; skipping"
+          else
+            pnpm publish --provenance --access public --no-git-checks
+          fi
 
   github-release:
     name: Create GitHub Release
-    needs: [check-release, build-binaries, publish, publish-sandbox]
+    needs: [check-release, build-binaries, publish-packages]
     if: >-
       always() &&
       needs.build-binaries.result == 'success' &&
       needs.check-release.outputs.needs_github_release == 'true' &&
-      (needs.publish.result == 'success' || needs.publish.result == 'skipped') &&
-      (needs.publish-sandbox.result == 'success' || needs.publish-sandbox.result == 'skipped')
+      (needs.publish-packages.result == 'success' || needs.publish-packages.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

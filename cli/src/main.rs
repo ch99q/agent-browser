@@ -1,3 +1,4 @@
+mod ca_bundle;
 mod chat;
 mod color;
 mod commands;
@@ -13,6 +14,7 @@ mod read;
 mod skills;
 #[cfg(test)]
 mod test_utils;
+mod tls;
 mod upgrade;
 mod validation;
 
@@ -20,6 +22,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
+#[cfg(unix)]
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{exit, Command};
 
@@ -28,7 +32,7 @@ use windows_sys::Win32::Foundation::CloseHandle;
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::OpenProcess;
 
-use commands::{gen_id, parse_command, ParseError};
+use commands::{attach_ca_cert_to_launch_command, gen_id, parse_command, ParseError};
 use connection::{
     cleanup_stale_files, daemon_unreachable, ensure_daemon, get_socket_dir, is_pid_alive,
     send_command, walk_daemons, DaemonOptions, Response,
@@ -91,8 +95,94 @@ fn attach_script_launch_options(launch_cmd: &mut serde_json::Value, flags: &Flag
     }
 }
 
+fn attach_webmcp_launch_option(launch_cmd: &mut serde_json::Value, flags: &Flags) {
+    if flags.no_webmcp || flags.cli_no_webmcp {
+        launch_cmd["webmcp"] = json!(!flags.no_webmcp);
+    }
+}
+
+fn attach_allowed_domains_to_launch_command(launch_cmd: &mut serde_json::Value, flags: &Flags) {
+    if let Some(ref domains) = flags.allowed_domains {
+        launch_cmd["allowedDomains"] = json!(domains);
+    }
+}
+
+fn attach_pin_tab_to_command(cmd: &mut serde_json::Value, flags: &Flags) {
+    if flags.pin_tab {
+        cmd["pinTab"] = json!(true);
+    } else if flags.cli_pin_tab {
+        cmd["pinTab"] = json!(false);
+    }
+}
+
+fn attach_input_mode(cmd: &mut serde_json::Value, flags: &Flags) {
+    if flags.cli_input_mode {
+        cmd["defaultInputMode"] = json!(flags.input_mode);
+    }
+}
+
 fn attach_plugins_to_command(cmd: &mut serde_json::Value, plugins: &[plugins::PluginConfig]) {
     cmd["plugins"] = json!(plugins);
+}
+
+fn command_is_external_launch(cmd: &serde_json::Value) -> bool {
+    cmd.get("action").and_then(|value| value.as_str()) == Some("launch")
+        && (cmd.get("cdpUrl").is_some()
+            || cmd.get("cdpPort").is_some()
+            || cmd.get("provider").is_some()
+            || cmd
+                .get("autoConnect")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false))
+}
+
+/// Commands that make their own HTTPS requests and never need a browser
+/// launch. `--ca-cert` applies only to CLI trust for these. A `batch` given
+/// as arguments counts when every command in it is one of these.
+fn command_is_browserless(cmd: &serde_json::Value) -> bool {
+    match cmd.get("action").and_then(|value| value.as_str()) {
+        Some("read") => true,
+        Some("batch") => {
+            let first_words: Vec<Option<String>> =
+                if let Some(argv) = cmd.get("argv").and_then(|v| v.as_array()) {
+                    argv.iter()
+                        .map(|c| c.get(0).and_then(|w| w.as_str()).map(str::to_string))
+                        .collect()
+                } else if let Some(commands) = cmd.get("commands").and_then(|v| v.as_array()) {
+                    commands
+                        .iter()
+                        .map(|c| {
+                            c.as_str()
+                                .and_then(|c| commands::shell_words_split(c).into_iter().next())
+                        })
+                        .collect()
+                } else {
+                    return false;
+                };
+            !first_words.is_empty() && first_words.iter().all(|w| w.as_deref() == Some("read"))
+        }
+        _ => false,
+    }
+}
+
+fn build_provider_launch_command(provider: &str, flags: &Flags) -> serde_json::Value {
+    let mut launch_cmd = json!({
+        "id": gen_id(),
+        "action": "launch",
+        "provider": provider
+    });
+    launch_cmd["plugins"] = json!(flags.plugins.clone());
+    attach_script_launch_options(&mut launch_cmd, flags);
+    attach_webmcp_launch_option(&mut launch_cmd, flags);
+    attach_allowed_domains_to_launch_command(&mut launch_cmd, flags);
+    attach_restore_config_to_command(&mut launch_cmd, flags);
+    attach_ca_cert_to_launch_command(&mut launch_cmd, flags);
+
+    if let Some(ref cs) = flags.color_scheme {
+        launch_cmd["colorScheme"] = json!(cs);
+    }
+
+    launch_cmd
 }
 
 fn restore_key_from_flags(flags: &Flags) -> Option<&str> {
@@ -126,7 +216,104 @@ fn incompatible_launch_mode_error(flags: &Flags) -> Option<&'static str> {
         return Some("Cannot use --extension with --cdp (extensions require local browser)");
     }
 
+    // The WebGPU preset is Chrome launch flags; it cannot be applied to a
+    // browser agent-browser did not launch. Rejecting (rather than silently
+    // ignoring) matches the --extension handling above. `--webgpu false`
+    // overrides an env/config-enabled preset for these modes.
+    if flags.webgpu && flags.cdp.is_some() {
+        return Some(
+            "Cannot use --webgpu with --cdp (the WebGPU preset requires a local browser launch; pass --webgpu false to override env/config)",
+        );
+    }
+    if flags.webgpu && flags.provider.is_some() {
+        return Some(
+            "Cannot use --webgpu with -p/--provider (the WebGPU preset requires a local browser launch; pass --webgpu false to override env/config)",
+        );
+    }
+    if flags.webgpu && flags.auto_connect {
+        return Some(
+            "Cannot use --webgpu with --auto-connect (the WebGPU preset requires a local browser launch; pass --webgpu false to override env/config)",
+        );
+    }
+
+    if flags.ca_cert.is_some() && flags.ignore_https_errors {
+        return Some("Cannot use --ca-cert with --ignore-https-errors");
+    }
+    if flags.ca_cert.is_some() && flags.clear_ca_cert {
+        return Some("Cannot use --ca-cert with --no-ca-cert");
+    }
+    if flags.ca_cert.is_some() && flags.cdp.is_some() {
+        return Some(
+            "Cannot use --ca-cert with --cdp (--ca-cert requires a locally launched Chromium browser on Linux)",
+        );
+    }
+    if flags.ca_cert.is_some() && flags.auto_connect {
+        return Some(
+            "Cannot use --ca-cert with --auto-connect (--ca-cert requires a locally launched Chromium browser on Linux)",
+        );
+    }
+    if flags.ca_cert.is_some() && flags.provider.is_some() {
+        return Some(
+            "Cannot use --ca-cert with -p/--provider (--ca-cert requires a locally launched Chromium browser on Linux)",
+        );
+    }
+    if flags.ca_cert.is_some() && flags.profile.is_some() {
+        return Some(
+            "Cannot use --ca-cert with --profile because isolated CA trust would change the profile's NSS environment",
+        );
+    }
+    if flags.ca_cert.is_some()
+        && flags
+            .engine
+            .as_deref()
+            .is_some_and(|engine| !engine.eq_ignore_ascii_case("chrome"))
+    {
+        return Some("--ca-cert is supported only with the Chrome engine on Linux");
+    }
+    if flags.ca_cert.is_some() && !cfg!(target_os = "linux") {
+        return Some("--ca-cert browser trust is currently supported only on Linux (read, install, upgrade, and doctor accept it on every platform)");
+    }
+
     None
+}
+
+fn should_send_local_launch_config(flags: &Flags, command: &serde_json::Value) -> bool {
+    (flags.headed
+        || flags.cli_headed
+        || flags.executable_path.is_some()
+        || flags.profile.is_some()
+        || flags.state.is_some()
+        || flags.proxy.is_some()
+        || flags.args.is_some()
+        || flags.user_agent.is_some()
+        || ((flags.ca_cert.is_some() || flags.clear_ca_cert) && !command_is_browserless(command))
+        || flags.allow_file_access
+        || should_send_hide_scrollbars_launch_option(
+            flags.cli_hide_scrollbars,
+            flags.hide_scrollbars,
+        )
+        || flags.webgpu
+        || flags.cli_webgpu
+        || flags.no_webmcp
+        || flags.cli_no_webmcp
+        || flags.color_scheme.is_some()
+        || flags.download_path.is_some()
+        || flags.engine.is_some()
+        || flags.allowed_domains.is_some()
+        || !flags.init_scripts.is_empty()
+        || !flags.enable.is_empty()
+        || !flags.extensions.is_empty())
+        && flags.cdp.is_none()
+        && flags.provider.is_none()
+        && !flags.auto_connect
+        && !command_is_external_launch(command)
+}
+
+/// Sends this invocation's resolved Obscura bypass setting, including an explicit clear.
+fn attach_obscura_proxy_bypass(cmd: &mut serde_json::Value, flags: &Flags) {
+    if flags.engine.as_deref() == Some("obscura") {
+        cmd["proxyBypass"] = json!(flags.proxy_bypass);
+    }
 }
 
 fn attach_restore_config_to_command(cmd: &mut serde_json::Value, flags: &Flags) {
@@ -630,26 +817,276 @@ fn get_dashboard_pid_path() -> std::path::PathBuf {
     get_socket_dir().join("dashboard.pid")
 }
 
-fn run_dashboard_start(port: u16, json_mode: bool) {
+fn get_dashboard_config_path() -> std::path::PathBuf {
+    get_socket_dir().join("dashboard.config")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct DashboardConfig {
+    port: u16,
+    allowed_origins: Vec<String>,
+    #[serde(default)]
+    access_token: Option<String>,
+}
+
+impl DashboardConfig {
+    fn new(port: u16, allowed_origins: Vec<String>) -> Result<Self, String> {
+        let access_token = if allowed_origins.is_empty() {
+            None
+        } else {
+            Some(generate_dashboard_access_token()?)
+        };
+        Ok(Self {
+            port,
+            allowed_origins,
+            access_token,
+        })
+    }
+
+    fn allowed_origins_description(&self) -> String {
+        if self.allowed_origins.is_empty() {
+            "loopback origins only".to_string()
+        } else {
+            self.allowed_origins.join(",")
+        }
+    }
+
+    fn has_valid_access_token(&self) -> bool {
+        self.allowed_origins.is_empty()
+            || self
+                .access_token
+                .as_deref()
+                .is_some_and(native::stream::is_valid_dashboard_access_token)
+    }
+
+    fn has_same_settings_as(&self, requested: &Self) -> bool {
+        self.port == requested.port && self.allowed_origins == requested.allowed_origins
+    }
+
+    fn access_urls(&self) -> Vec<String> {
+        let Some(token) = self.access_token.as_deref() else {
+            return Vec::new();
+        };
+        self.allowed_origins
+            .iter()
+            .map(|origin| format!("{origin}/#dashboard-access-token={token}"))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DashboardCommand {
+    Start {
+        port: u16,
+        allowed_origins: Option<String>,
+    },
+    Stop,
+}
+
+/// Parse dashboard-specific arguments independently of the general command
+/// parser. This keeps the standalone lifecycle strict: unknown flags, missing
+/// values, invalid ports, and options supplied to `stop` are all errors.
+fn parse_dashboard_command(args: &[String]) -> Result<DashboardCommand, String> {
+    let (subcommand, mut index) = match args.first().map(String::as_str) {
+        Some("start") => ("start", 1),
+        Some("stop") => ("stop", 1),
+        Some(value) if !value.starts_with('-') => {
+            return Err(format!("Unknown dashboard subcommand: {value}"));
+        }
+        _ => ("start", 0),
+    };
+
+    if subcommand == "stop" {
+        if let Some(argument) = args.get(index) {
+            return Err(format!(
+                "Dashboard stop does not accept argument '{argument}'."
+            ));
+        }
+        return Ok(DashboardCommand::Stop);
+    }
+
+    let mut port = 4848;
+    let mut saw_port = false;
+    let mut allowed_origins = None;
+
+    while let Some(argument) = args.get(index) {
+        match argument.as_str() {
+            "--port" => {
+                if saw_port {
+                    return Err(
+                        "Dashboard option '--port' was provided more than once.".to_string()
+                    );
+                }
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| "Dashboard option '--port' requires a value.".to_string())?;
+                port = value.parse::<u16>().ok().filter(|port| *port > 0).ok_or_else(|| {
+                    format!("Invalid dashboard port '{value}'. Expected an integer from 1 to 65535.")
+                })?;
+                saw_port = true;
+                index += 2;
+            }
+            "--allowed-origins" => {
+                if allowed_origins.is_some() {
+                    return Err(
+                        "Dashboard option '--allowed-origins' was provided more than once."
+                            .to_string(),
+                    );
+                }
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| {
+                        "Dashboard option '--allowed-origins' requires a value.".to_string()
+                    })?;
+                allowed_origins = Some(value.clone());
+                index += 2;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("Unknown dashboard option: {value}"));
+            }
+            value => {
+                return Err(format!("Unexpected dashboard argument: {value}"));
+            }
+        }
+    }
+
+    Ok(DashboardCommand::Start {
+        port,
+        allowed_origins,
+    })
+}
+
+fn generate_dashboard_access_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| format!("Failed to generate dashboard access token: {error}"))?;
+    Ok(hex::encode(bytes))
+}
+
+fn read_dashboard_config() -> Option<DashboardConfig> {
+    let contents = fs::read_to_string(get_dashboard_config_path()).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+fn remove_dashboard_sidecars() {
+    let _ = fs::remove_file(get_dashboard_pid_path());
+    let _ = fs::remove_file(get_dashboard_config_path());
+}
+
+fn write_dashboard_config(config: &DashboardConfig) -> std::io::Result<()> {
+    let contents = serde_json::to_vec(config).map_err(std::io::Error::other)?;
+    let path = get_dashboard_config_path();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(&contents)
+    }
+
+    #[cfg(windows)]
+    {
+        fs::write(path, contents)
+    }
+}
+
+fn dashboard_config_issue(
+    running: Option<&DashboardConfig>,
+    requested: &DashboardConfig,
+) -> Option<String> {
+    let Some(running) = running else {
+        return Some(
+            "Dashboard is already running, but its configuration could not be verified. Run 'agent-browser dashboard stop' before starting it again."
+                .to_string(),
+        );
+    };
+    if !running.has_valid_access_token() {
+        return Some(
+            "Dashboard is already running, but its access-token configuration could not be verified. Run 'agent-browser dashboard stop' before starting it again."
+                .to_string(),
+        );
+    }
+    if running.has_same_settings_as(requested) {
+        return None;
+    }
+
+    Some(format!(
+        "Dashboard is already running with port {} and {}. Run 'agent-browser dashboard stop' before starting it with different settings.",
+        running.port,
+        running.allowed_origins_description()
+    ))
+}
+
+/// Start the dashboard with an explicit proxy-origin allowlist and a unique
+/// access token. Both are kept separate from the request Host so DNS rebinding
+/// cannot grant access to an attacker-controlled origin. Persist the effective
+/// settings beside the PID so repeated starts cannot silently claim that a live
+/// process adopted different settings.
+fn run_dashboard_start(port: u16, allowed_origins: Vec<String>, json_mode: bool) {
     let pid_path = get_dashboard_pid_path();
 
     // Check if already running
     if let Ok(pid_str) = fs::read_to_string(&pid_path) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
             if is_pid_alive(pid) {
+                let running_config = read_dashboard_config();
+                let requested_config = DashboardConfig {
+                    port,
+                    allowed_origins,
+                    access_token: None,
+                };
+                if let Some(error) =
+                    dashboard_config_issue(running_config.as_ref(), &requested_config)
+                {
+                    if json_mode {
+                        print_json_error(error);
+                    } else {
+                        eprintln!("{} {}", color::error_indicator(), error);
+                    }
+                    exit(1);
+                }
                 if json_mode {
+                    let access_urls = running_config
+                        .as_ref()
+                        .map(DashboardConfig::access_urls)
+                        .unwrap_or_default();
                     print_json_value(json!({
                         "success": true,
-                        "data": { "port": port, "pid": pid, "already_running": true },
+                        "data": { "port": requested_config.port, "pid": pid, "already_running": true, "access_urls": access_urls },
                     }));
                 } else {
-                    println!("Dashboard already running at http://localhost:{}", port);
+                    println!(
+                        "Dashboard already running at http://localhost:{}",
+                        requested_config.port
+                    );
+                    print_dashboard_access_urls(&running_config.expect("verified above"));
                 }
                 return;
             }
         }
-        let _ = fs::remove_file(&pid_path);
+        remove_dashboard_sidecars();
+    } else {
+        let _ = fs::remove_file(get_dashboard_config_path());
     }
+
+    let requested_config = match DashboardConfig::new(port, allowed_origins) {
+        Ok(config) => config,
+        Err(error) => {
+            if json_mode {
+                print_json_error(error);
+            } else {
+                eprintln!("{} {}", color::error_indicator(), error);
+            }
+            exit(1);
+        }
+    };
 
     let socket_dir = get_socket_dir();
     if !socket_dir.exists() {
@@ -673,8 +1110,26 @@ fn run_dashboard_start(port: u16, json_mode: bool) {
     };
 
     let mut cmd = std::process::Command::new(&exe_path);
-    cmd.env("AGENT_BROWSER_DASHBOARD", "1")
-        .env("AGENT_BROWSER_DASHBOARD_PORT", port.to_string());
+    cmd.env("AGENT_BROWSER_DASHBOARD", "1").env(
+        "AGENT_BROWSER_DASHBOARD_PORT",
+        requested_config.port.to_string(),
+    );
+    if requested_config.allowed_origins.is_empty() {
+        cmd.env_remove("AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS");
+        cmd.env_remove("AGENT_BROWSER_DASHBOARD_ACCESS_TOKEN");
+    } else {
+        cmd.env(
+            "AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS",
+            requested_config.allowed_origins.join(","),
+        )
+        .env(
+            "AGENT_BROWSER_DASHBOARD_ACCESS_TOKEN",
+            requested_config
+                .access_token
+                .as_deref()
+                .expect("generated above"),
+        );
+    }
 
     #[cfg(unix)]
     {
@@ -701,20 +1156,44 @@ fn run_dashboard_start(port: u16, json_mode: bool) {
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        Ok(child) => {
+        Ok(mut child) => {
             let pid = child.id();
-            let _ = fs::write(&pid_path, pid.to_string());
+            let write_result = write_dashboard_config(&requested_config)
+                .and_then(|()| fs::write(&pid_path, pid.to_string()));
+            if let Err(error) = write_result {
+                let _ = child.kill();
+                remove_dashboard_sidecars();
+                if json_mode {
+                    print_json_error(format!("Failed to save dashboard state: {error}"));
+                } else {
+                    eprintln!(
+                        "{} Failed to save dashboard state: {}",
+                        color::error_indicator(),
+                        error
+                    );
+                }
+                exit(1);
+            }
 
             if json_mode {
                 print_json_value(json!({
                     "success": true,
-                    "data": { "port": port, "pid": pid },
+                    "data": { "port": requested_config.port, "pid": pid, "access_urls": requested_config.access_urls() },
                 }));
             } else {
-                println!("Dashboard started at http://localhost:{}", port);
+                println!(
+                    "Dashboard started{}",
+                    if requested_config.access_urls().is_empty() {
+                        format!(" at http://localhost:{}", requested_config.port)
+                    } else {
+                        "; open one of the private access URLs below".to_string()
+                    }
+                );
+                print_dashboard_access_urls(&requested_config);
             }
         }
         Err(e) => {
+            remove_dashboard_sidecars();
             if json_mode {
                 print_json_error(format!("Failed to start dashboard: {}", e));
             } else {
@@ -729,12 +1208,28 @@ fn run_dashboard_start(port: u16, json_mode: bool) {
     }
 }
 
+fn print_dashboard_access_urls(config: &DashboardConfig) {
+    let access_urls = config.access_urls();
+    if access_urls.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "{} Keep these reverse-proxy dashboard URLs private: they contain access tokens.",
+        color::warning_indicator()
+    );
+    for url in access_urls {
+        println!("{url}");
+    }
+}
+
 fn run_dashboard_stop(json_mode: bool) {
     let pid_path = get_dashboard_pid_path();
 
     let pid_str = match fs::read_to_string(&pid_path) {
         Ok(s) => s,
         Err(_) => {
+            remove_dashboard_sidecars();
             if json_mode {
                 print_json_value(
                     json!({ "success": true, "data": { "stopped": false, "reason": "not running" } }),
@@ -749,7 +1244,7 @@ fn run_dashboard_stop(json_mode: bool) {
     let pid: u32 = match pid_str.trim().parse() {
         Ok(p) => p,
         Err(_) => {
-            let _ = fs::remove_file(&pid_path);
+            remove_dashboard_sidecars();
             if json_mode {
                 print_json_value(
                     json!({ "success": true, "data": { "stopped": false, "reason": "invalid pid" } }),
@@ -778,7 +1273,7 @@ fn run_dashboard_stop(json_mode: bool) {
         }
     }
 
-    let _ = fs::remove_file(&pid_path);
+    remove_dashboard_sidecars();
 
     if json_mode {
         print_json_value(json!({ "success": true, "data": { "stopped": true } }));
@@ -816,7 +1311,10 @@ fn run_close_all(flags: &Flags) {
     for (session, pid) in &sessions {
         let cmd = json!({ "id": gen_id(), "action": "close" });
         match send_command(cmd, session) {
-            Ok(resp) if resp.success => closed.push(session.clone()),
+            Ok(resp) if resp.success => {
+                tls::clear_session(session);
+                closed.push(session.clone());
+            }
             Ok(resp) => {
                 let err = resp.error.unwrap_or_else(|| "Unknown error".to_string());
                 failed.push((session.clone(), err));
@@ -918,6 +1416,7 @@ fn main() {
         env::set_var("AGENT_BROWSER_NAMESPACE", namespace);
     }
     let clean = clean_args(&args);
+    tls::configure_process(&flags);
 
     let has_help = args.iter().any(|a| a == "--help" || a == "-h");
     let has_version = args.iter().any(|a| a == "--version" || a == "-V");
@@ -963,34 +1462,60 @@ fn main() {
             quick: args.iter().any(|a| a == "--quick"),
             fix: args.iter().any(|a| a == "--fix"),
             json: flags.json,
+            // Explicit CLI opt-in only: a global AGENT_BROWSER_WEBGPU/config
+            // "webgpu": true must not make every doctor run launch the extra
+            // Chrome probe (and fail on hosts missing Vulkan deps).
+            webgpu: flags.cli_webgpu && flags.webgpu,
+            debug: flags.debug,
+            // Merged (env/config included) so the probe reflects how the
+            // user's sessions actually launch.
+            headed: flags.headed,
         };
         exit(doctor::run_doctor(opts));
     }
 
     // Handle dashboard subcommand
     if clean.first().map(|s| s.as_str()) == Some("dashboard") {
-        match clean.get(1).map(|s| s.as_str()) {
-            Some("start") | None => {
-                let port = clean
-                    .iter()
-                    .position(|a| a == "--port")
-                    .and_then(|i| clean.get(i + 1))
-                    .and_then(|s| s.parse::<u16>().ok())
-                    .unwrap_or(4848);
-                run_dashboard_start(port, flags.json);
-                return;
+        let dashboard_args = &clean[1..];
+        let command = match parse_dashboard_command(dashboard_args) {
+            Ok(command) => command,
+            Err(error) => {
+                if flags.json {
+                    print_json_error(error);
+                } else {
+                    eprintln!("{} {}", color::error_indicator(), error);
+                }
+                exit(1);
             }
-            Some("stop") => {
+        };
+
+        match command {
+            DashboardCommand::Stop => {
                 run_dashboard_stop(flags.json);
                 return;
             }
-            Some(unknown) => {
-                eprintln!(
-                    "{} Unknown dashboard subcommand: {}",
-                    color::error_indicator(),
-                    unknown
-                );
-                exit(1);
+            DashboardCommand::Start {
+                port,
+                allowed_origins,
+            } => {
+                let env_allowed_origins = env::var("AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS").ok();
+                let configured_origins = allowed_origins
+                    .as_deref()
+                    .or(env_allowed_origins.as_deref());
+                let allowed_origins =
+                    match native::stream::normalize_dashboard_allowed_origins(configured_origins) {
+                        Ok(origins) => origins,
+                        Err(error) => {
+                            if flags.json {
+                                print_json_error(error);
+                            } else {
+                                eprintln!("{} {}", color::error_indicator(), error);
+                            }
+                            exit(1);
+                        }
+                    };
+                run_dashboard_start(port, allowed_origins, flags.json);
+                return;
             }
         }
     }
@@ -1071,7 +1596,18 @@ fn main() {
             exit(1);
         }
     };
-
+    attach_input_mode(&mut cmd, &flags);
+    // Stdin batches are read before launch decisions so a batch of `read`
+    // commands is recognized as browserless, like one given as arguments.
+    if cmd.get("action").and_then(|v| v.as_str()) == Some("batch") && cmd.get("commands").is_none()
+    {
+        cmd["argv"] = json!(read_batch_stdin(&flags));
+    }
+    match cmd.get("action").and_then(|v| v.as_str()) {
+        Some("read") => cmd["tls"] = json!(tls::session_options(&flags, &flags.session)),
+        Some("close") => tls::clear_session(&flags.session),
+        _ => {}
+    }
     // Handle --password-stdin for auth save
     if cmd.get("action").and_then(|v| v.as_str()) == Some("auth_save") {
         if cmd.get("password").is_some() {
@@ -1107,12 +1643,12 @@ fn main() {
     // current config without a restart. The daemon strips this from stream
     // broadcasts before observers see the command payload.
     attach_plugins_to_command(&mut cmd, &flags.plugins);
+
+    attach_pin_tab_to_command(&mut cmd, &flags);
     attach_restore_config_to_command(&mut cmd, &flags);
 
-    let restore_key = restore_key_from_flags(&flags);
-
     // Validate restore/session persistence name before starting daemon
-    if let Some(name) = restore_key {
+    if let Some(name) = restore_key_from_flags(&flags) {
         if !validation::is_valid_session_name(name) {
             let msg = validation::session_name_error(name);
             if flags.json {
@@ -1149,12 +1685,14 @@ fn main() {
                 success: true,
                 data: Some(data),
                 error: None,
+                code: None,
                 warning: None,
             },
             Err(e) => connection::Response {
                 success: false,
                 data: None,
                 error: Some(e),
+                code: None,
                 warning: None,
             },
         };
@@ -1166,7 +1704,17 @@ fn main() {
         return;
     }
 
-    if let Some(msg) = incompatible_launch_mode_error(&flags) {
+    let launch_mode_error = if command_is_browserless(&cmd) {
+        let ca_cert = flags.ca_cert.take();
+        let clear_ca_cert = std::mem::take(&mut flags.clear_ca_cert);
+        let error = incompatible_launch_mode_error(&flags);
+        flags.ca_cert = ca_cert;
+        flags.clear_ca_cert = clear_ca_cert;
+        error
+    } else {
+        incompatible_launch_mode_error(&flags)
+    };
+    if let Some(msg) = launch_mode_error {
         if flags.json {
             print_json_error(msg);
         } else {
@@ -1174,6 +1722,23 @@ fn main() {
         }
         exit(1);
     }
+
+    if let Some(ref ca_path) = flags.ca_cert {
+        if let Err(msg) = ca_bundle::load(ca_path) {
+            if flags.json {
+                print_json_error(&msg);
+            } else {
+                eprintln!("{} {}", color::error_indicator(), msg);
+            }
+            exit(1);
+        }
+        let canonical = std::path::Path::new(ca_path)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(ca_path));
+        flags.ca_cert = Some(canonical.display().to_string());
+    }
+
+    let restore_key = restore_key_from_flags(&flags);
 
     // Parse proxy URL to separate server from credentials for the daemon.
     let (proxy_server, proxy_username, proxy_password) = if let Some(ref proxy_str) = flags.proxy {
@@ -1200,6 +1765,7 @@ fn main() {
         ignore_https_errors: flags.ignore_https_errors,
         allow_file_access: flags.allow_file_access,
         hide_scrollbars: flags.hide_scrollbars,
+        webgpu: flags.webgpu,
         profile: flags.profile.as_deref(),
         state: flags.state.as_deref(),
         provider: flags.provider.as_deref(),
@@ -1215,6 +1781,7 @@ fn main() {
         confirm_actions: flags.confirm_actions.as_deref(),
         engine: flags.engine.as_deref(),
         auto_connect: flags.auto_connect,
+        pin_tab: flags.pin_tab,
         idle_timeout: flags.idle_timeout.as_deref(),
         default_timeout: flags.default_timeout,
         cdp: flags.cdp.as_deref(),
@@ -1245,11 +1812,16 @@ fn main() {
             "autoConnect": true
         });
         attach_script_launch_options(&mut launch_cmd, &flags);
+        attach_webmcp_launch_option(&mut launch_cmd, &flags);
+        attach_allowed_domains_to_launch_command(&mut launch_cmd, &flags);
+        attach_pin_tab_to_command(&mut launch_cmd, &flags);
         attach_restore_config_to_command(&mut launch_cmd, &flags);
 
         if flags.ignore_https_errors {
             launch_cmd["ignoreHTTPSErrors"] = json!(true);
         }
+
+        attach_ca_cert_to_launch_command(&mut launch_cmd, &flags);
 
         if let Some(ref cs) = flags.color_scheme {
             launch_cmd["colorScheme"] = json!(cs);
@@ -1341,11 +1913,16 @@ fn main() {
 
         let mut launch_cmd = launch_cmd;
         attach_script_launch_options(&mut launch_cmd, &flags);
+        attach_webmcp_launch_option(&mut launch_cmd, &flags);
+        attach_allowed_domains_to_launch_command(&mut launch_cmd, &flags);
+        attach_pin_tab_to_command(&mut launch_cmd, &flags);
         attach_restore_config_to_command(&mut launch_cmd, &flags);
 
         if flags.ignore_https_errors {
             launch_cmd["ignoreHTTPSErrors"] = json!(true);
         }
+
+        attach_ca_cert_to_launch_command(&mut launch_cmd, &flags);
 
         if let Some(ref cs) = flags.color_scheme {
             launch_cmd["colorScheme"] = json!(cs);
@@ -1376,18 +1953,7 @@ fn main() {
 
     // Launch with cloud provider if -p flag is set.
     if let Some(ref provider) = flags.provider {
-        let mut launch_cmd = json!({
-            "id": gen_id(),
-            "action": "launch",
-            "provider": provider
-        });
-        launch_cmd["plugins"] = json!(flags.plugins.clone());
-        attach_script_launch_options(&mut launch_cmd, &flags);
-        attach_restore_config_to_command(&mut launch_cmd, &flags);
-
-        if let Some(ref cs) = flags.color_scheme {
-            launch_cmd["colorScheme"] = json!(cs);
-        }
+        let launch_cmd = build_provider_launch_command(provider, &flags);
 
         let err = match send_command(launch_cmd, &flags.session) {
             Ok(resp) if resp.success => None,
@@ -1409,34 +1975,20 @@ fn main() {
     }
 
     // Launch headed browser or configure browser options (without CDP or provider)
-    if (flags.headed
-        || flags.cli_headed  // User explicitly set --headed (even if false)
-        || flags.executable_path.is_some()
-        || flags.profile.is_some()
-        || flags.state.is_some()
-        || flags.proxy.is_some()
-        || flags.args.is_some()
-        || flags.user_agent.is_some()
-        || flags.allow_file_access
-        || should_send_hide_scrollbars_launch_option(
-            flags.cli_hide_scrollbars,
-            flags.hide_scrollbars,
-        )
-        || flags.color_scheme.is_some()
-        || flags.download_path.is_some()
-        || flags.engine.is_some()
-        || !flags.init_scripts.is_empty()
-        || !flags.enable.is_empty()
-        || !flags.extensions.is_empty())
-        && flags.cdp.is_none()
-        && flags.provider.is_none()
-        && !flags.auto_connect
-    {
+    if should_send_local_launch_config(&flags, &cmd) {
         let mut launch_cmd = json!({
             "id": gen_id(),
             "action": "launch",
-            "headless": !flags.headed
         });
+        // Only send headless when the user set it on this invocation. When
+        // absent, the daemon falls back to its spawn-time AGENT_BROWSER_HEADED
+        // env, so a follow-up command without --headed (common when env vars
+        // like AGENT_BROWSER_ARGS force a launch command on every call) does
+        // not flip a headed session back to headless and relaunch the browser
+        // onto about:blank.
+        if flags.headed || flags.cli_headed {
+            launch_cmd["headless"] = json!(!flags.headed);
+        }
         launch_cmd["plugins"] = json!(flags.plugins.clone());
         attach_restore_config_to_command(&mut launch_cmd, &flags);
 
@@ -1504,6 +2056,8 @@ fn main() {
             launch_cmd["ignoreHTTPSErrors"] = json!(true);
         }
 
+        attach_ca_cert_to_launch_command(&mut launch_cmd, &flags);
+
         if flags.allow_file_access {
             launch_cmd["allowFileAccess"] = json!(true);
         }
@@ -1514,6 +2068,16 @@ fn main() {
             flags.hide_scrollbars,
         );
 
+        if flags.webgpu || flags.cli_webgpu {
+            launch_cmd["webgpu"] = json!(flags.webgpu);
+        }
+        attach_webmcp_launch_option(&mut launch_cmd, &flags);
+
+        // Env-only opt-out for automatic Xvfb; always stamped from the CLI's
+        // fresh environment so both setting and unsetting the var take effect
+        // on daemons spawned before the change.
+        launch_cmd["noXvfb"] = json!(flags.no_xvfb);
+
         if let Some(ref cs) = flags.color_scheme {
             launch_cmd["colorScheme"] = json!(cs);
         }
@@ -1522,13 +2086,12 @@ fn main() {
             launch_cmd["downloadPath"] = json!(dp);
         }
 
-        if let Some(ref domains) = flags.allowed_domains {
-            launch_cmd["allowedDomains"] = json!(domains);
-        }
+        attach_allowed_domains_to_launch_command(&mut launch_cmd, &flags);
 
         if let Some(ref engine) = flags.engine {
             launch_cmd["engine"] = json!(engine);
         }
+        attach_obscura_proxy_bypass(&mut launch_cmd, &flags);
 
         match send_command(launch_cmd, &flags.session) {
             Ok(resp) if !resp.success => {
@@ -1564,12 +2127,16 @@ fn main() {
     // Handle batch command: from args or stdin
     if cmd.get("action").and_then(|v| v.as_str()) == Some("batch") {
         let bail = cmd.get("bail").and_then(|v| v.as_bool()).unwrap_or(false);
-        let arg_commands = cmd.get("commands").and_then(|v| v.as_array()).map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(commands::shell_words_split)
-                .collect::<Vec<Vec<String>>>()
-        });
+        let arg_commands = cmd
+            .get("commands")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(commands::shell_words_split)
+                    .collect::<Vec<Vec<String>>>()
+            })
+            .or_else(|| serde_json::from_value(cmd.get("argv")?.clone()).ok());
         run_batch(&flags, &daemon_opts, bail, arg_commands);
         return;
     }
@@ -1629,46 +2196,47 @@ fn send_command_with_respawn(
     }
 }
 
+/// Read batch commands given on stdin as a JSON array of string arrays.
+fn read_batch_stdin(flags: &Flags) -> Vec<Vec<String>> {
+    use std::io::Read as _;
+
+    let mut input = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut input) {
+        if flags.json {
+            print_json_error(format!("Failed to read stdin: {}", e));
+        } else {
+            eprintln!("{} Failed to read stdin: {}", color::error_indicator(), e);
+        }
+        exit(1);
+    }
+
+    match serde_json::from_str(&input) {
+        Ok(c) => c,
+        Err(e) => {
+            if flags.json {
+                print_json_error(format!(
+                    "Invalid JSON input: {}. Expected an array of string arrays, e.g. [[\"open\", \"https://example.com\"], [\"snapshot\"]]",
+                    e
+                ));
+            } else {
+                eprintln!(
+                    "{} Invalid JSON input: {}. Expected an array of string arrays.",
+                    color::error_indicator(),
+                    e
+                );
+            }
+            exit(1);
+        }
+    }
+}
+
 fn run_batch(
     flags: &Flags,
     daemon_opts: &DaemonOptions,
     bail: bool,
     arg_commands: Option<Vec<Vec<String>>>,
 ) {
-    let commands: Vec<Vec<String>> = if let Some(cmds) = arg_commands {
-        cmds
-    } else {
-        use std::io::Read as _;
-
-        let mut input = String::new();
-        if let Err(e) = std::io::stdin().read_to_string(&mut input) {
-            if flags.json {
-                print_json_error(format!("Failed to read stdin: {}", e));
-            } else {
-                eprintln!("{} Failed to read stdin: {}", color::error_indicator(), e);
-            }
-            exit(1);
-        }
-
-        match serde_json::from_str(&input) {
-            Ok(c) => c,
-            Err(e) => {
-                if flags.json {
-                    print_json_error(format!(
-                        "Invalid JSON input: {}. Expected an array of string arrays, e.g. [[\"open\", \"https://example.com\"], [\"snapshot\"]]",
-                        e
-                    ));
-                } else {
-                    eprintln!(
-                        "{} Invalid JSON input: {}. Expected an array of string arrays.",
-                        color::error_indicator(),
-                        e
-                    );
-                }
-                exit(1);
-            }
-        }
-    };
+    let commands: Vec<Vec<String>> = arg_commands.unwrap_or_else(|| read_batch_stdin(flags));
 
     if commands.is_empty() {
         if flags.json {
@@ -1714,6 +2282,12 @@ fn run_batch(
                 continue;
             }
         };
+        attach_input_mode(&mut parsed, flags);
+        match parsed.get("action").and_then(|v| v.as_str()) {
+            Some("read") => parsed["tls"] = json!(tls::session_options(flags, &flags.session)),
+            Some("close") => tls::clear_session(&flags.session),
+            _ => {}
+        }
 
         let action = parsed
             .get("action")
@@ -1722,15 +2296,30 @@ fn run_batch(
         attach_plugins_to_command(&mut parsed, &flags.plugins);
         attach_restore_config_to_command(&mut parsed, flags);
 
+        attach_pin_tab_to_command(&mut parsed, flags);
+
         match send_command_with_respawn(parsed, &flags.session, daemon_opts) {
             Ok(resp) => {
                 if flags.json {
-                    results.push(json!({
+                    let mut result = json!({
                         "command": cmd_args,
                         "success": resp.success,
                         "result": resp.data,
                         "error": resp.error,
-                    }));
+                    });
+                    // Match the single-command `Response` serialization,
+                    // which only emits `code` when set (e.g. `tab_gone`).
+                    // Without this, machine-readable error codes are
+                    // silently dropped in batch mode.
+                    if let Some(ref code) = resp.code {
+                        result["code"] = json!(code);
+                    }
+                    // Mirror the single-command serialization: emit `warning`
+                    // too, not just `code`.
+                    if let Some(ref warning) = resp.warning {
+                        result["warning"] = json!(warning);
+                    }
+                    results.push(result);
                 } else {
                     if i > 0 {
                         println!();
@@ -1782,7 +2371,91 @@ fn run_batch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn input_mode_session_setting_preserves_command_override() {
+        let args: Vec<String> = ["--input-mode", "smooth", "click", "#button", "--human"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let flags = crate::flags::parse_flags(&args);
+        let mut command =
+            crate::commands::parse_command(&crate::flags::clean_args(&args), &flags).unwrap();
+        super::attach_input_mode(&mut command, &flags);
+        assert_eq!(command["defaultInputMode"], "smooth");
+        assert_eq!(command["inputMode"], "human");
+    }
+
     use super::*;
+
+    #[test]
+    fn dashboard_config_comparison_rejects_unknown_or_changed_settings() {
+        let requested = DashboardConfig::new(
+            4848,
+            native::stream::normalize_dashboard_allowed_origins(Some(
+                "https://second.example.com, https://dashboard.example.com",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let equivalent = DashboardConfig::new(
+            4848,
+            native::stream::normalize_dashboard_allowed_origins(Some(
+                "https://dashboard.example.com,https://second.example.com",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let changed = DashboardConfig::new(
+            4849,
+            native::stream::normalize_dashboard_allowed_origins(Some(
+                "https://dashboard.example.com",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(dashboard_config_issue(Some(&equivalent), &requested), None);
+        assert!(dashboard_config_issue(Some(&changed), &requested).is_some());
+        assert!(dashboard_config_issue(None, &requested).is_some());
+    }
+
+    #[test]
+    fn dashboard_parser_accepts_explicit_start_options() {
+        let args = vec![
+            "start".to_string(),
+            "--port".to_string(),
+            "8080".to_string(),
+            "--allowed-origins".to_string(),
+            "https://dashboard.example.com".to_string(),
+        ];
+
+        assert_eq!(
+            parse_dashboard_command(&args),
+            Ok(DashboardCommand::Start {
+                port: 8080,
+                allowed_origins: Some("https://dashboard.example.com".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn dashboard_parser_rejects_invalid_or_unknown_options() {
+        for args in [
+            vec!["--bogus"],
+            vec!["start", "--allowed-origin", "https://dashboard.example.com"],
+            vec!["start", "--port", "nope"],
+            vec!["start", "--port", "0"],
+            vec!["start", "--port"],
+            vec!["start", "--allowed-origins"],
+            vec!["stop", "--port", "4848"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(
+                parse_dashboard_command(&args).is_err(),
+                "unexpectedly accepted {args:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_proxy_simple() {
@@ -1872,6 +2545,225 @@ mod tests {
         assert_eq!(cli_true_cmd["hideScrollbars"], true);
     }
 
+    fn neutral_launch_config_flags() -> Flags {
+        let mut flags = parse_flags(&[]);
+        flags.headed = false;
+        flags.cli_headed = false;
+        flags.executable_path = None;
+        flags.profile = None;
+        flags.state = None;
+        flags.proxy = None;
+        flags.args = None;
+        flags.user_agent = None;
+        flags.ignore_https_errors = false;
+        flags.ca_cert = None;
+        flags.clear_ca_cert = false;
+        flags.allow_file_access = false;
+        flags.hide_scrollbars = true;
+        flags.cli_hide_scrollbars = false;
+        flags.webgpu = false;
+        flags.cli_webgpu = false;
+        flags.no_webmcp = false;
+        flags.cli_no_webmcp = false;
+        flags.color_scheme = None;
+        flags.download_path = None;
+        flags.engine = None;
+        flags.allowed_domains = None;
+        flags.init_scripts.clear();
+        flags.enable.clear();
+        flags.extensions.clear();
+        flags.cdp = None;
+        flags.provider = None;
+        flags.auto_connect = false;
+        flags
+    }
+
+    #[test]
+    fn test_attach_allowed_domains_to_launch_command() {
+        let mut flags = neutral_launch_config_flags();
+        flags.allowed_domains = Some(vec!["example.com".to_string(), "*.example.org".to_string()]);
+        let mut cmd = json!({ "action": "launch" });
+
+        attach_allowed_domains_to_launch_command(&mut cmd, &flags);
+
+        assert_eq!(
+            cmd["allowedDomains"],
+            json!(["example.com", "*.example.org"])
+        );
+    }
+
+    #[test]
+    fn test_attach_pin_tab_to_command_preserves_preference() {
+        let mut flags = neutral_launch_config_flags();
+
+        let mut absent_cmd = json!({ "action": "launch" });
+        attach_pin_tab_to_command(&mut absent_cmd, &flags);
+        assert!(absent_cmd.get("pinTab").is_none());
+
+        flags.pin_tab = true;
+        let mut enabled_cmd = json!({ "action": "launch" });
+        attach_pin_tab_to_command(&mut enabled_cmd, &flags);
+        assert_eq!(enabled_cmd["pinTab"], true);
+
+        flags.pin_tab = false;
+        flags.cli_pin_tab = true;
+        let mut disabled_cmd = json!({ "action": "launch" });
+        attach_pin_tab_to_command(&mut disabled_cmd, &flags);
+        assert_eq!(disabled_cmd["pinTab"], false);
+    }
+
+    #[test]
+    fn test_provider_launch_command_preserves_ca_clear_transition() {
+        let mut flags = neutral_launch_config_flags();
+        flags.clear_ca_cert = true;
+
+        let cmd = build_provider_launch_command("browserbase", &flags);
+
+        assert_eq!(cmd["clearCaCert"], true);
+        assert!(cmd.get("caCert").is_none());
+    }
+
+    #[test]
+    fn test_ca_cert_launch_transition_distinguishes_set_omit_and_clear() {
+        let mut flags = neutral_launch_config_flags();
+        let mut omitted = json!({ "action": "launch" });
+        attach_ca_cert_to_launch_command(&mut omitted, &flags);
+        assert!(omitted.get("caCert").is_none());
+        assert!(omitted.get("clearCaCert").is_none());
+
+        flags.ca_cert = Some("/tmp/proxy-ca.pem".to_string());
+        let mut set = json!({ "action": "launch" });
+        attach_ca_cert_to_launch_command(&mut set, &flags);
+        assert_eq!(set["caCert"], "/tmp/proxy-ca.pem");
+        assert!(set.get("clearCaCert").is_none());
+
+        flags.ca_cert = None;
+        flags.clear_ca_cert = true;
+        let mut cleared = json!({ "action": "launch" });
+        attach_ca_cert_to_launch_command(&mut cleared, &flags);
+        assert!(cleared.get("caCert").is_none());
+        assert_eq!(cleared["clearCaCert"], true);
+    }
+
+    #[test]
+    fn test_connect_launch_command_preserves_ca_clear_transition() {
+        let mut flags = neutral_launch_config_flags();
+        flags.clear_ca_cert = true;
+        let cmd = parse_command(&["connect".to_string(), "9222".to_string()], &flags).unwrap();
+
+        assert_eq!(cmd["cdpPort"], 9222);
+        assert_eq!(cmd["clearCaCert"], true);
+        assert!(!should_send_local_launch_config(&flags, &cmd));
+    }
+
+    #[test]
+    fn test_ca_transition_is_attached_only_to_launch_commands() {
+        let mut flags = neutral_launch_config_flags();
+        flags.clear_ca_cert = true;
+        let mut launch = json!({ "action": "launch", "autoConnect": true });
+        let mut snapshot = json!({ "action": "snapshot" });
+
+        attach_ca_cert_to_launch_command(&mut launch, &flags);
+        attach_ca_cert_to_launch_command(&mut snapshot, &flags);
+
+        assert_eq!(launch["clearCaCert"], true);
+        assert!(snapshot.get("clearCaCert").is_none());
+    }
+
+    #[test]
+    fn test_published_schemas_define_pin_tab_boolean() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("cli should have a repository parent");
+        let root_schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_root.join("agent-browser.schema.json")).unwrap(),
+        )
+        .unwrap();
+        let docs_schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_root.join("docs/public/schema.json")).unwrap(),
+        )
+        .unwrap();
+
+        let root_pin_tab = &root_schema["properties"]["pinTab"];
+        let docs_pin_tab = &docs_schema["properties"]["pinTab"];
+        assert_eq!(root_pin_tab["type"], "boolean");
+        assert_eq!(docs_pin_tab["type"], "boolean");
+        assert_eq!(root_pin_tab, docs_pin_tab);
+    }
+
+    #[test]
+    fn test_published_schemas_define_matching_ca_cert_string() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("cli should have a repository parent");
+        let root_schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_root.join("agent-browser.schema.json")).unwrap(),
+        )
+        .unwrap();
+        let docs_schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_root.join("docs/public/schema.json")).unwrap(),
+        )
+        .unwrap();
+
+        let root_ca_cert = &root_schema["properties"]["caCert"];
+        let docs_ca_cert = &docs_schema["properties"]["caCert"];
+        assert_eq!(root_ca_cert["type"], "string");
+        assert_eq!(docs_ca_cert["type"], "string");
+        assert_eq!(root_ca_cert, docs_ca_cert);
+        assert_eq!(root_schema["properties"]["clearCaCert"]["type"], "boolean");
+        assert_eq!(
+            root_schema["properties"]["clearCaCert"],
+            docs_schema["properties"]["clearCaCert"]
+        );
+    }
+
+    #[test]
+    fn test_published_schemas_define_matching_no_webmcp_boolean() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("cli should have a repository parent");
+        let root_schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_root.join("agent-browser.schema.json")).unwrap(),
+        )
+        .unwrap();
+        let docs_schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_root.join("docs/public/schema.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(root_schema["properties"]["noWebmcp"]["type"], "boolean");
+        assert_eq!(
+            root_schema["properties"]["noWebmcp"],
+            docs_schema["properties"]["noWebmcp"]
+        );
+    }
+
+    #[test]
+    fn test_allowed_domains_requests_local_launch_configuration() {
+        let mut flags = neutral_launch_config_flags();
+        let command = json!({ "action": "snapshot" });
+        assert!(!should_send_local_launch_config(&flags, &command));
+
+        flags.allowed_domains = Some(vec!["example.com".to_string()]);
+        assert!(should_send_local_launch_config(&flags, &command));
+
+        flags.cdp = Some("9222".to_string());
+        assert!(!should_send_local_launch_config(&flags, &command));
+    }
+
+    #[test]
+    fn test_no_webmcp_requests_local_launch_configuration() {
+        let mut flags = neutral_launch_config_flags();
+        let command = json!({ "action": "snapshot" });
+        flags.no_webmcp = true;
+        flags.cli_no_webmcp = true;
+        assert!(should_send_local_launch_config(&flags, &command));
+
+        let mut launch = json!({ "action": "launch" });
+        attach_webmcp_launch_option(&mut launch, &flags);
+        assert_eq!(launch["webmcp"], false);
+    }
+
     #[test]
     fn test_attach_plugins_to_command_adds_registry_payload() {
         let plugins = vec![crate::plugins::PluginConfig {
@@ -1955,6 +2847,8 @@ mod tests {
 
     fn launch_mode_flags(auto_connect: bool, cdp: bool, provider: bool, extensions: bool) -> Flags {
         let mut flags = parse_flags(&[]);
+        // Deterministic regardless of ambient AGENT_BROWSER_WEBGPU.
+        flags.webgpu = false;
         flags.auto_connect = auto_connect;
         flags.cdp = cdp.then(|| "9222".to_string());
         flags.provider = provider.then(|| "ios".to_string());
@@ -1997,6 +2891,120 @@ mod tests {
     }
 
     #[test]
+    fn test_incompatible_launch_mode_error_rejects_webgpu_attach_modes() {
+        let with_webgpu = |mut flags: Flags| {
+            flags.webgpu = true;
+            flags
+        };
+        let cases = [
+            (
+                with_webgpu(launch_mode_flags(false, true, false, false)),
+                "Cannot use --webgpu with --cdp (the WebGPU preset requires a local browser launch; pass --webgpu false to override env/config)",
+            ),
+            (
+                with_webgpu(launch_mode_flags(false, false, true, false)),
+                "Cannot use --webgpu with -p/--provider (the WebGPU preset requires a local browser launch; pass --webgpu false to override env/config)",
+            ),
+            (
+                with_webgpu(launch_mode_flags(true, false, false, false)),
+                "Cannot use --webgpu with --auto-connect (the WebGPU preset requires a local browser launch; pass --webgpu false to override env/config)",
+            ),
+        ];
+        for (flags, expected) in cases {
+            assert_eq!(incompatible_launch_mode_error(&flags), Some(expected));
+        }
+
+        // webgpu alone (local launch) is fine.
+        assert_eq!(
+            incompatible_launch_mode_error(&with_webgpu(launch_mode_flags(
+                false, false, false, false
+            ))),
+            None
+        );
+        // Attach modes without webgpu stay allowed.
+        assert_eq!(
+            incompatible_launch_mode_error(&launch_mode_flags(false, true, false, false)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_incompatible_launch_mode_error_rejects_ca_cert_modes() {
+        let with_ca = |mut flags: Flags| {
+            flags.ca_cert = Some("/tmp/ca.pem".to_string());
+            flags
+        };
+        let mut clear = with_ca(launch_mode_flags(false, false, false, false));
+        clear.clear_ca_cert = true;
+        let mut ignore_errors = with_ca(launch_mode_flags(false, false, false, false));
+        ignore_errors.ignore_https_errors = true;
+        let mut profile = with_ca(launch_mode_flags(false, false, false, false));
+        profile.profile = Some("/tmp/profile".to_string());
+        let mut lightpanda = with_ca(launch_mode_flags(false, false, false, false));
+        lightpanda.engine = Some("lightpanda".to_string());
+
+        let cases = [
+            (
+                with_ca(launch_mode_flags(false, true, false, false)),
+                "Cannot use --ca-cert with --cdp (--ca-cert requires a locally launched Chromium browser on Linux)",
+            ),
+            (
+                with_ca(launch_mode_flags(true, false, false, false)),
+                "Cannot use --ca-cert with --auto-connect (--ca-cert requires a locally launched Chromium browser on Linux)",
+            ),
+            (
+                with_ca(launch_mode_flags(false, false, true, false)),
+                "Cannot use --ca-cert with -p/--provider (--ca-cert requires a locally launched Chromium browser on Linux)",
+            ),
+            (
+                ignore_errors,
+                "Cannot use --ca-cert with --ignore-https-errors",
+            ),
+            (
+                profile,
+                "Cannot use --ca-cert with --profile because isolated CA trust would change the profile's NSS environment",
+            ),
+            (
+                lightpanda,
+                "--ca-cert is supported only with the Chrome engine on Linux",
+            ),
+            (clear, "Cannot use --ca-cert with --no-ca-cert"),
+        ];
+
+        for (flags, expected) in cases {
+            assert_eq!(incompatible_launch_mode_error(&flags), Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_readme_proxy_ca_config_uses_compatible_options() {
+        let readme = include_str!("../../README.md");
+        let marker = "**Example proxy CA configuration:**";
+        let example = readme
+            .split_once(marker)
+            .and_then(|(_, rest)| rest.split_once("```json"))
+            .and_then(|(_, rest)| rest.split_once("```"))
+            .map(|(json, _)| json.trim())
+            .expect("README proxy CA configuration example");
+        let config: flags::Config = serde_json::from_str(example).unwrap();
+        let mut flags = neutral_launch_config_flags();
+        flags.profile = config.profile;
+        flags.ignore_https_errors = config.ignore_https_errors.unwrap_or(false);
+        flags.ca_cert = config.ca_cert;
+        flags.clear_ca_cert = config.clear_ca_cert.unwrap_or(false);
+        flags.cdp = config.cdp;
+        flags.auto_connect = config.auto_connect.unwrap_or(false);
+        flags.provider = config.provider;
+        flags.engine = config.engine;
+
+        let error = incompatible_launch_mode_error(&flags);
+        assert!(
+            error.is_none() || error == Some("--ca-cert browser trust is currently supported only on Linux (read, install, upgrade, and doctor accept it on every platform)"),
+            "README proxy CA configuration is incompatible: {error:?}"
+        );
+    }
+
+    #[test]
     fn test_incompatible_launch_mode_error_allows_compatible_flags() {
         assert_eq!(
             incompatible_launch_mode_error(&launch_mode_flags(true, false, false, false)),
@@ -2025,6 +3033,7 @@ mod tests {
     fn test_confirmation_prompt_from_response_finds_nested_confirm_result() {
         let resp = Response {
             success: true,
+            code: None,
             data: Some(json!({
                 "confirmed": true,
                 "action": "navigate",
